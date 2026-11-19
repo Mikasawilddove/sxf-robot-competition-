@@ -44,7 +44,9 @@ bash tools/run_match.sh cake-only --at-start-a --speed fast --planner dwa
 | 运输与放置 | 运输携带抓取时的物块 ID，到站停车后再次确认持物。释放后连续看到同一物块处于目标区、与吸盘分离且位置稳定，才累计该物块 | 途中失去持物证据或落区未确认时停止，本次物块不计数 |
 | 整场收尾 | 蛋糕优先送 A。普通块在当前站的可抓候选中按配送代价选择，出发前和实际抓取前各判断一次剩余时间 | 时间不足时保留已确认的配送结果。蛋糕专项抓取失败即结束；整场模式按配置在确认空手后继续普通块 |
 
-取物站顺序来自 `mission.yaml` 的 `sorting_points`。只配置 `Sorting_W` 时，程序只使用西侧。加入其他侧之前，先核对地图绑定和实录站位。定位、控制或已发运动目标的故障会独立上报。
+取物站顺序来自 `mission.yaml` 的 `sorting_points`。四侧配置优先西侧，然后南、东、北。程序在找到可抓目标后进入抓取。现场文件 `data/waypoints/pickup_approaches_20261119.json` 保存四侧实录位姿、沿车头反方向退开的距离和入口使用的候选位姿。重新建图时应重新核对该文件的地图绑定、禁行区和站位净空。读板站、放置站继续取自各自原有的现场记录。
+
+蛋糕专项从 A 朝 D 起跑。现场验收时，核对同一运行目录的 `result.json` 中 `scope=cake-only`、`execution=completed`、`delivered_confirmed.cake=1`，其余类别均为零。用 `report.actions` 和 `report.objects` 核对同一蛋糕 ID 的已确认抓取、运送和一次已确认放置，终态为 `placed_confirmed`、区域为 A；同时核实蛋糕实际落在 A 红区内。
 
 运行后查看 `reports/runs/<run_id>/result.json`。先看 `report.phase` 和 `report.error` 定位失败阶段，再用 `report.board_evidence`、`report.actions` 和 `report.objects` 核对本局映射、动作和每个物块的最终状态。离线可用以下命令演练指定的分类板排列。
 

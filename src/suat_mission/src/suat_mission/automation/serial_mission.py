@@ -50,6 +50,20 @@ def resolve_serial_config(config, root):
             if name in points and points[name]!=pose:
                 raise ValueError('additional waypoints conflict with recorded station: '+name)
             points[name]=pose
+    if result.get('pickup_stations_file'):
+        pickup_file = resource(root, result['pickup_stations_file'])
+        pickup = json.loads(pickup_file.read_text(encoding='utf-8'))
+        validate_map_identity(pickup, binding)
+        approaches = pickup.get('waypoints', {})
+        if (pickup.get('frame_id') != 'map' or not isinstance(approaches, dict)
+                or set(approaches) != {'Sorting_W', 'Sorting_S', 'Sorting_E', 'Sorting_N'}):
+            raise ValueError('four map-frame pickup approaches required in ' + str(pickup_file))
+        for name, pose in approaches.items():
+            if (not isinstance(pose, list) or len(pose) != 3
+                    or not all(type(v) in (int, float) and math.isfinite(v) for v in pose)):
+                raise ValueError('invalid pickup approach: ' + name)
+        points.update(approaches)
+        result['pickup_stations_file'] = str(pickup_file)
     result['waypoints'] = points
     if result.get('mission_scope') == 'cake-only':
         result['max_base_alignments'] = 0

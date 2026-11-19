@@ -37,7 +37,8 @@ target_frames: 5
 target_min_frames: 3
 target_max_distance_px: 35.0
 target_roi: []
-sorting_points: [Sorting_W]
+pickup_stations_file: data/waypoints/pickup_approaches_20261119.json
+sorting_points: [Sorting_W, Sorting_S, Sorting_E, Sorting_N]
 each_count: 3
 mission_timeout: 600.0
 judge_clock_already_running: false # development trial default; not a measured timing value
