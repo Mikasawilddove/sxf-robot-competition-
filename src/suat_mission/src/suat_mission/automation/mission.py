@@ -57,6 +57,9 @@ class MissionReport:
     skipped: list = field(default_factory=list)
     degraded: bool = False
     cycle_seconds: list = field(default_factory=list)
+    handling_seconds: list = field(default_factory=list)
+    phase: str = 'prepare'
+    pickup_station: str = ''
 
 
 class Mission:
@@ -73,6 +76,7 @@ class Mission:
         self.ledger = ActionLedger(self.report.run_id, clock)
         self.world = WorldModel(clock, self.config.observation_max_age)
         self.attempts = {}
+        self.retry_after_station = None
 
     def _action(self, action, function, *args, object_id=''):
         self._check()
@@ -98,10 +102,11 @@ class Mission:
         if self.clock() >= self.end_time:
             raise MissionError("competition deadline reached")
 
-    def _nav(self, name):
+    def _nav(self, name, *, object_id=''):
         self._check()
         self._event("navigate:" + name)
-        self._action('navigate', self.robot.navigate, name, max(0.0, self.end_time - self.clock()))
+        self._action('navigate', self.robot.navigate, name, max(0.0, self.end_time - self.clock()),
+                     object_id=object_id)
         self._check()
 
     def _read_board(self):
@@ -110,6 +115,7 @@ class Mission:
         reader = getattr(self.robot, 'read_board_mapping', None)
         attempts = []
         for station in stations:
+            self.report.phase = 'navigate_to_board'
             try:
                 self._nav(station)
             except ActionFailure as exc:
@@ -119,6 +125,7 @@ class Mission:
                 self.report.board_evidence = {'station_attempts': attempts}
                 self._event('board_station_unreachable:' + station)
                 continue
+            self.report.phase = 'read_board'
             if callable(getattr(self.robot, 'prepare_observation', None)):
                 self.robot.prepare_observation('board')
             self._check()
@@ -128,78 +135,87 @@ class Mission:
                 self._check()
                 attempts.append({'station': station, 'status': decision.reason})
                 self.report.board_evidence = dict(decision.evidence, station=station, station_attempts=attempts)
+                if decision.evidence.get('run_id') != self.report.run_id:
+                    raise MissionError('classification-board result belongs to another or unknown run')
                 if not decision.accepted:
                     self._event('board_station_rejected:' + station + ':' + decision.reason)
                     continue
-                self.report.board = dict(decision.mapping)
+                mapping = dict(decision.mapping)
             else:
                 frames = self.robot.read_board_frames()
                 self._check()
-                self.report.board = dict(vote_board(frames, self.config.zones,
-                                                   self.config.board_votes, self.config.board_threshold,
-                                                   axis=self.config.board_axis, reverse=self.config.board_reverse))
-            if set(self.report.board) != set(OBJECTS) or set(self.report.board.values()) != {'B','C','D'}:
+                mapping = dict(vote_board(frames, self.config.zones, self.config.board_votes,
+                                          self.config.board_threshold, axis=self.config.board_axis,
+                                          reverse=self.config.board_reverse))
+            if set(mapping) != set(OBJECTS) or set(mapping.values()) != {'B','C','D'}:
                 raise MissionError('incomplete classification-board mapping')
+            self.report.board = mapping
             self._event('board:' + str(self.report.board))
             return
         raise MissionError('no board station passed navigation and formal reading')
 
-    def _find(self, label):
-        for waypoint in self.config.sorting_points:
-            self._nav(waypoint)
-            if callable(getattr(self.robot, 'prepare_observation', None)):
-                self.robot.prepare_observation('objects')
-            self._check()
-            candidates = self.world.observe(self.robot.detect_objects())
-            self._check()
-            threshold = self.config.target_thresholds.get(label, self.config.target_threshold)
-            candidates = [d for d in candidates if d.graspable is not False and not d.occluded_by]
-            target = select_target(candidates, label, threshold, self.config.target_roi)
-            if target is not None:
-                return target
-        return None
-
     def _find_any(self, labels):
-        for waypoint in self.config.sorting_points:
-            self._nav(waypoint)
+        stations = list(self.config.sorting_points)
+        if self.retry_after_station in stations:
+            index = stations.index(self.retry_after_station) + 1
+            stations = stations[index:] + stations[:index]
+        self.retry_after_station = None
+        for waypoint in stations:
+            self.report.phase = 'navigate_to_pickup'
+            try:
+                self._nav(waypoint)
+            except ActionFailure as exc:
+                if exc.result.outcome != Outcome.UNREACHABLE:
+                    raise
+                self._event('pickup_station_unreachable:' + waypoint)
+                continue
+            self.report.pickup_station = waypoint
+            self.report.phase = 'observe_objects'
             if callable(getattr(self.robot, 'prepare_observation', None)):
                 self.robot.prepare_observation('objects')
             self._check()
             candidates = self.world.observe(self.robot.detect_objects())
+            self._check()
             candidates = [d for d in candidates if d.label in labels and d.graspable is not False
                           and not d.occluded_by and select_target([d], d.label,
                           self.config.target_thresholds.get(d.label, self.config.target_threshold),
                           self.config.target_roi) is not None]
             if candidates:
                 cost = getattr(self.robot, 'delivery_cost', None)
-                return min(candidates, key=lambda d: (cost(d, self.report.board[d.label]), -d.score)) if callable(cost) else max(candidates, key=lambda d: d.score)
+                if callable(cost) and 'cake' not in labels:
+                    return min(candidates, key=lambda d: (cost(d, self.report.board[d.label]), -d.score))
+                return max(candidates, key=lambda d: d.score)
         return None
 
     def _empty_confirmed(self):
         method = getattr(self.robot, 'empty_confirmed', None)
         return callable(method) and method() is True
 
-    def _cycle_fits(self):
-        recent = self.report.cycle_seconds[-3:]
+    def _cycle_fits(self, *, at_pickup=False):
+        recent = (self.report.handling_seconds if at_pickup else self.report.cycle_seconds)[-3:]
         estimate = max(recent)*1.15 if recent else self.config.initial_cycle_budget_seconds
         return self.end_time-self.clock() >= estimate+self.config.finish_margin_seconds
 
     def _deliver(self, label, zone, target=None, cycle_started=None):
         began = self.clock() if cycle_started is None else cycle_started
-        target = target or self._find(label)
+        target = target or self._find_any({label})
         if target is None:
             self._event("not_found:" + label)
             return False
         self._check()
+        handling_started = self.clock()
         self.world.reserve(target.object_id)
         self.attempts[target.object_id] = self.attempts.get(target.object_id, 0)+1
         self._event("pick:" + label)
+        self.report.phase = 'pick_and_verify_hold'
         try:
             result = self._action('pick', self.robot.pick, target, label, object_id=target.object_id)
             self.world.transition(target.object_id, ObjectState.RESERVED, ObjectState.HELD_CONFIRMED,
                                   result.evidence)
-            self._nav("Collection_" + zone)
+            self.report.phase = 'transport_to_zone'
+            self._nav("Collection_" + zone, object_id=target.object_id)
             self._check()
+            self.report.phase = 'place_and_verify_landing'
             self._event("drop:" + label + ":" + zone)
             result = self._action('place', self.robot.drop, zone, label, object_id=target.object_id)
             self.world.transition(target.object_id, ObjectState.HELD_CONFIRMED, ObjectState.PLACED_CONFIRMED,
@@ -212,6 +228,8 @@ class Mission:
                     self.report.skipped.append({'object_id':target.object_id, 'label':label,
                                                 'reason':exc.result.evidence})
                 self._event(('skip:' if exhausted else 'reobserve:')+target.object_id)
+                if exc.result.outcome == Outcome.UNREACHABLE:
+                    self.retry_after_station = self.report.pickup_station
                 return False
             self.world.uncertain(target.object_id, str(exc))
             raise
@@ -219,7 +237,9 @@ class Mission:
             self.world.uncertain(target.object_id, str(exc))
             raise
         self.report.delivered[label] += 1
-        self.report.cycle_seconds.append(self.clock()-began)
+        finished = self.clock()
+        self.report.handling_seconds.append(finished - handling_started)
+        self.report.cycle_seconds.append(finished - began)
         return True
 
     def run(self):
@@ -273,9 +293,13 @@ class Mission:
                 if target is None:
                     self._event('finish:no_remaining_feasible_target')
                     break
+                if not self._cycle_fits(at_pickup=True):
+                    self._event('finish:no_handling_time_at_pickup')
+                    break
                 self._deliver(target.label, self.report.board[target.label], target=target, cycle_started=began)
             self.report.status = ('completed' if cake_delivered and all(
                 self.report.delivered[label] == self.config.each_count for label in scope.regular_labels) else 'partial')
+            self.report.phase = 'finished'
         except (MissionError, ValueError) as exc:
             self.report.status = "aborted"
             self.report.error = str(exc)

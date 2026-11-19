@@ -496,9 +496,14 @@ class RosRobot:
         try:
             plan = make_plan()
         except NavigationPlanError as exc:
-            if name in getattr(self, 'board_candidates', {}):
+            candidate = (name == 'Classification_area' or name in getattr(self, 'board_candidates', {})
+                         or name in self.scope.sorting_points)
+            if candidate and str(exc) in (
+                    'goal body footprint is blocked on selected map', 'no complete live plan', 'one leg exceeds 8 m',
+                    'live planner returned a partial path', 'live path crosses central pickup keepout',
+                    'live path body overlaps occupied or unknown saved map cells'):
                 return ActionResult(self.active_context, Outcome.UNREACHABLE,
-                                    'no motion issued; board station plan refused: '+str(exc))
+                                    'no motion issued; candidate station plan refused: '+str(exc))
             raise MissionError('navigate '+name+': '+str(exc)) from exc
         self._before_navigation(name)
         plan['timeout_s'] = min(plan['timeout_s'], self.nav_timeout, float(remaining))
@@ -609,11 +614,6 @@ class SerialRosRobot(RosRobot):
         super().set_deadline(value)
         self.config['_deadline']=value
 
-    def detect_objects(self):
-        scene=super().detect_objects()
-        self.serial_runtime.observe_hand(scene)
-        return scene
-
     def board_stations(self):
         self._ensure_running()
         if not self.board_candidates:
@@ -676,7 +676,7 @@ class SerialRosRobot(RosRobot):
         return result
 
     def empty_confirmed(self):
-        return self.serial_runtime.empty_seen and self.serial_runtime.held is None
+        return self.serial_runtime.confirm_empty(self.latest_scene, self.deadline)
 
     def _before_navigation(self, name):
         if self.serial_runtime.held is None:

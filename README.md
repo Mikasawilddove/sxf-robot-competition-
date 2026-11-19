@@ -33,6 +33,25 @@ bash tools/run_match.sh cake-only --at-start-a --speed fast --planner dwa
 
 只查看两种模式的参数时，可用 `python3 tools/start_field_navigation.py --describe --owner mission --speed fast --planner rollout`，将末尾换成 `dwa` 查看另一组。正式日志会记录每段实际生效的采样参数、里程计速度峰值及最后停稳误差。
 
+## 整场任务怎样推进
+
+`cake-only` 完成读板和蛋糕送 A 后结束。`full` 沿用同一个 Enter 入口，接着按本局读板结果配送普通块。现场启用 `full` 前要核对选用的取物站、B/C/D 放置站和各区放置资源。
+
+| 阶段 | 脚本进入下一步的条件 | 条件未满足时 |
+| --- | --- | --- |
+| 停车读板 | 本局的新图像投票通过，时钟、熊、香蕉分别对应 B/C/D 中的一个区 | 单站票数不足或冲突时尝试下一候选站。结果属于其他局或所有站都失败时结束 |
+| 选物与抓取 | 当前取物站看到同一物块 ID，顶面可抓且无遮挡。串口后端在接近前重拍，抬升后用连续帧检查物块随吸盘移动 | 确认空手才能重试。若机械臂从该侧够不到，优先尝试配置中的下一侧。持物不明时结束 |
+| 运输与放置 | 运输携带抓取时的物块 ID，到站停车后再次确认持物。释放后连续看到同一物块处于目标区、与吸盘分离且位置稳定，才累计该物块 | 途中失去持物证据或落区未确认时停止，本次物块不计数 |
+| 整场收尾 | 蛋糕优先送 A。普通块在当前站的可抓候选中按配送代价选择，出发前和实际抓取前各判断一次剩余时间 | 时间不足时保留已确认的配送结果。蛋糕专项抓取失败即结束；整场模式按配置在确认空手后继续普通块 |
+
+取物站顺序来自 `mission.yaml` 的 `sorting_points`。只配置 `Sorting_W` 时，程序只使用西侧。加入其他侧之前，先核对地图绑定和实录站位。定位、控制或已发运动目标的故障会独立上报。
+
+运行后查看 `reports/runs/<run_id>/result.json`。先看 `report.phase` 和 `report.error` 定位失败阶段，再用 `report.board_evidence`、`report.actions` 和 `report.objects` 核对本局映射、动作和每个物块的最终状态。离线可用以下命令演练指定的分类板排列。
+
+```bash
+PYTHONPATH=src/suat_mission/src python3 -m suat_mission.automation.simulator --board clock,teddybear,banana
+```
+
 ## 本地现场资源
 
 部署时保留现场已核验的选图配置、地图、起点和路线、读板与抓取标定，以及视觉所需模板。选图配置位于 `src/suat_mission/config/selected_map.yaml`，现场数据位于 `data/`，模板位于 `src/suat_mission/assets/templates/`。运行记录写入 `reports/`。这些资源和凭据由团队另行管理，公开仓库提供可审查、可回退的代码版本。

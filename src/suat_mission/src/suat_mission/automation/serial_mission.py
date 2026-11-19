@@ -77,6 +77,9 @@ def resolve_serial_config(config, root):
 class SerialMissionRuntime:
     def __init__(self, root, config, next_scene, ensure_running, align_base):
         self.root, self.config = Path(root), config
+        self.confirm_frames = config.get('manipulation_confirm_frames', 2)
+        if type(self.confirm_frames) is not int or self.confirm_frames < 1:
+            raise ValueError('manipulation_confirm_frames must be a positive integer')
         self.geometry = PickupGeometry.load(config['pickup_geometry_file'])
         self.next_scene, self.ensure, self.align_base = next_scene, ensure_running, align_base
         self.run = Path(config['run_directory'])/'manipulation'
@@ -88,7 +91,6 @@ class SerialMissionRuntime:
         self.selected_target = None
         self.arm_pose = None
         self.last_hold_seen = 0.
-        self.empty_seen = False
         self.slots = {}
         self.events = []
         self.active_pub = None
@@ -161,7 +163,7 @@ class SerialMissionRuntime:
                 raise RuntimeError('instance producer restarted during the mission')
             self.scene_id=scene.scene_id
             if scene.observed_at<self.observed_after:continue
-            self.last_scene=scene;self.observe_hand(scene)
+            self.last_scene=scene
             return scene
         raise TimeoutError('fresh synchronized scene unavailable')
 
@@ -216,7 +218,7 @@ class SerialMissionRuntime:
         tolerance=min(edge_clearance,float(self.geometry.values.get('alignment_tolerance_mm',5.)))
         height_tolerance=float(self.geometry.values.get('height_tolerance_mm',12.))
         step=float(self.geometry.values.get('max_visual_correction_mm',30.))
-        required=int(self.config.get('manipulation_confirm_frames',2))
+        required=self.confirm_frames
         aligned=[]
         corrections=0
         until=min(deadline,time.monotonic()+8.)
@@ -276,42 +278,85 @@ class SerialMissionRuntime:
                 return target
         raise TimeoutError('selected physical object not observed in a fresh scene')
 
-    def observe_hand(self,scene):
-        hand=scene.manipulation.get('gripper',{})
-        if (scene.observed_at>=self.observed_after and hand.get('state')=='empty'
-                and bool(hand.get('evidence')) and self.held is None):
-            self.empty_seen=True
+    def confirm_empty(self, scene, deadline):
+        if self.held is not None or self.session is None or self.session.pump_may_be_on:
+            return False
+        until = min(deadline, time.monotonic() + float(self.config.get('observation_timeout', 5.)))
+        while time.monotonic() < until:
+            self.ensure()
+            if scene is not None and (self.scene_id is None or scene.scene_id == self.scene_id):
+                age = time.monotonic() - scene.observed_at
+                hand = scene.manipulation.get('gripper', {})
+                if (scene.observed_at >= self.observed_after
+                        and 0 <= age <= float(self.config.get('observation_max_age', 2.))
+                        and hand.get('state') == 'empty' and hand.get('evidence')):
+                    return True
+            try:
+                scene = self.fresh_scene(until)
+            except TimeoutError:
+                break
+        return False
+
+    def unreachable_pick(self, context, reason):
+        empty = self.confirm_empty(self.last_scene, context.deadline)
+        return ActionResult(context, Outcome.UNREACHABLE if empty else Outcome.UNKNOWN, str(reason))
+
+    @staticmethod
+    def observed_target(scene, object_id, label):
+        return next((d for d in scene.detections if d.object_id == object_id and d.label == label), None)
+
+    @staticmethod
+    def observed_empty_for(scene, object_id):
+        hand = scene.manipulation.get('gripper', {})
+        return hand.get('state') == 'empty' and bool(hand.get('evidence')) and hand.get('object_id') == object_id
+
+    def payload_at_cup(self, scene, point):
+        return (self.matches_observed_cup(scene,point)
+                and not self.observed_empty_for(scene,self.held))
 
     def _confirm_pick(self,target,top_before,lift,deadline):
         held_votes=empty_votes=0
-        needed=int(self.config.get('manipulation_confirm_frames',2))
+        needed=self.confirm_frames
         tolerance=float(self.geometry.values.get('holding_position_tolerance_mm',25.))
         while time.monotonic()<deadline:
-            current=self.fresh_target(target.object_id,deadline)
+            scene=self.fresh_scene(deadline)
+            current=self.observed_target(scene,target.object_id,target.label)
+            if current is None:
+                held_votes=empty_votes=0
+                continue
             try:point=self.geometry.payload_point(current)
             except GeometryUnavailable:
                 held_votes=empty_votes=0;continue
-            scene=self.last_scene
             held=(point[2]>=top_before[2]+lift*.5 and self.matches_observed_cup(scene,point))
             # Gripper empty is positive depth visibility, not missing detection.
-            hand=scene.manipulation.get('gripper',{})
-            empty=(hand.get('state')=='empty' and bool(hand.get('evidence'))
-                   and hand.get('object_id')==target.object_id and math.dist(point,top_before)<=tolerance)
-            held_votes=held_votes+1 if held else 0
-            empty_votes=empty_votes+1 if empty else 0
+            hand_empty=self.observed_empty_for(scene,target.object_id)
+            empty=hand_empty and math.dist(point,top_before)<=tolerance
+            held_votes=held_votes+1 if held and not hand_empty else 0
+            empty_votes=empty_votes+1 if empty and not held else 0
             if held_votes>=needed:return True,point
             if empty_votes>=needed:return False,point
         raise TimeoutError('neither held nor positively empty observed')
 
-    def _wait_target(self, object_id, deadline, predicate):
-        votes=0;required=int(self.config.get('manipulation_confirm_frames',2))
+    def _wait_target(self, object_id, deadline, predicate, *, point_of=None, stable_mm=None):
+        votes=0;required=self.confirm_frames
+        point_of = point_of or self.geometry.payload_point
+        anchor=None
         while time.monotonic()<deadline:
-            target=self.fresh_target(object_id,deadline)
+            scene=self.fresh_scene(deadline)
+            target=self.observed_target(scene,object_id,self.held_label)
+            if target is None:
+                votes=0;anchor=None
+                continue
             try:
-                point=self.geometry.payload_point(target)
+                point=point_of(target)
             except GeometryUnavailable:
-                votes=0;continue
-            votes=votes+1 if predicate(target,point) else 0
+                votes=0;anchor=None;continue
+            if not predicate(target,point):
+                votes=0;anchor=None
+                continue
+            if stable_mm is not None and (anchor is None or math.dist(point,anchor)>stable_mm):
+                votes=0;anchor=point
+            votes+=1
             if votes>=required:
                 return target,point
         raise TimeoutError('fresh visual manipulation evidence did not converge')
@@ -328,6 +373,10 @@ class SerialMissionRuntime:
             lift=float(self.geometry.values.get('lift_offset_mm',50.))
             remaining_adjustments=max(0,int(self.config.get('max_base_alignments',2))-_alignment_round)
             for index in range(remaining_adjustments+1):
+                if target.label != label:
+                    return ActionResult(context,Outcome.UNKNOWN,'selected physical object changed class')
+                if target.graspable is not True or target.occluded_by:
+                    raise GeometryUnavailable('fresh target is occluded or lacks a graspable surface')
                 dx,dy=self.geometry.base_adjustment(target)
                 candidate=self.geometry.contact(target)
                 if math.hypot(dx,dy)<=1. and self.reachable_grasp(candidate,approach,lift,context.deadline):
@@ -356,8 +405,7 @@ class SerialMissionRuntime:
             self.event('grasp_projection',object_id=target.object_id,contact_command_mm=contact,
                        **projection)
         except GeometryUnavailable as exc:
-            outcome=Outcome.UNREACHABLE if self.empty_seen else Outcome.UNKNOWN
-            return ActionResult(context,outcome,str(exc))
+            return self.unreachable_pick(context,exc)
         approach=float(self.geometry.values.get('approach_offset_mm',40.))
         lift=float(self.geometry.values.get('lift_offset_mm',50.))
         self.active('pick',target)
@@ -371,7 +419,7 @@ class SerialMissionRuntime:
             except BaseAlignmentRequired as exc:
                 self.move('empty_travel',self.geometry.values['empty_travel_pose_mm'],context.deadline)
                 if _alignment_round>=int(self.config.get('max_base_alignments',2)) or math.hypot(*exc.error)>100.:
-                    return ActionResult(context,Outcome.UNREACHABLE if self.empty_seen else Outcome.UNKNOWN,str(exc))
+                    return self.unreachable_pick(context,exc)
                 report=self.align_base(exc.error[0],exc.error[1],context,_alignment_round)
                 self.event('visual_base_align',report=report,measured_error_mm=exc.error)
                 if not report['passed']:return ActionResult(context,Outcome.FAILED,'visual base adjustment failed: '+json.dumps(report))
@@ -379,10 +427,9 @@ class SerialMissionRuntime:
                 return self.pick(target,label,context,_alignment_round+1)
             except GeometryUnavailable as exc:
                 self.observation('objects',context.deadline)
-                return ActionResult(context,Outcome.UNREACHABLE if self.empty_seen else Outcome.UNKNOWN,str(exc))
+                return self.unreachable_pick(context,exc)
         self.move('contact',contact,context.deadline)
         self.session.pump(True,deadline=context.deadline)
-        self.empty_seen=False
         self.held=target.object_id  # possible holding until image evidence settles it
         self.held_label=label
         self.move('lift',[contact[0],contact[1],contact[2]+lift],context.deadline,loaded=True)
@@ -395,7 +442,7 @@ class SerialMissionRuntime:
             return ActionResult(context,Outcome.UNKNOWN,'pump may hold an object; lift not visually confirmed')
         if not held:
             self.session.pump(False,deadline=context.deadline)
-            self.held=None;self.held_label='';self.empty_seen=True
+            self.held=None;self.held_label=''
             self.observation('objects',context.deadline)
             return ActionResult(context,Outcome.NOT_ACQUIRED,'selected target stayed on support; gripper volume visibly empty')
         self.last_hold_seen=time.monotonic()
@@ -403,7 +450,7 @@ class SerialMissionRuntime:
         self.active('carrying',target)
         self._wait_target(target.object_id,min(context.deadline,time.monotonic()+
             float(self.config.get('feedback_timeout',15.))),lambda d,p:
-            self.matches_observed_cup(self.last_scene,p))
+            self.payload_at_cup(self.last_scene,p))
         self.last_hold_seen=time.monotonic()
         self.event('holding_confirmed',object_id=target.object_id,observed_top_mm=point)
         return ActionResult(context,Outcome.CONFIRMED,'fresh top motion matches measured cup lift: '+target.object_id)
@@ -411,11 +458,11 @@ class SerialMissionRuntime:
     def check_carrying(self, scene):
         if self.held is None:
             return
-        target=next((d for d in scene.detections if d.object_id==self.held),None) if scene else None
+        target=self.observed_target(scene,self.held,self.held_label) if scene and scene.scene_id==self.scene_id else None
         if target is not None:
             try:
                 point=self.geometry.payload_point(target)
-                if self.matches_observed_cup(scene,point):
+                if self.payload_at_cup(scene,point):
                     self.last_hold_seen=scene.observed_at
             except GeometryUnavailable:
                 pass
@@ -423,8 +470,12 @@ class SerialMissionRuntime:
             raise RuntimeError('holding observation lost or stale; preserve suction and stop travel')
 
     def drop(self, zone, label, context):
-        if self.held!=context.object_id:
+        if self.held!=context.object_id or self.held_label!=label:
             return ActionResult(context,Outcome.UNKNOWN,'placement does not match the held object')
+        self.observed_after=time.monotonic()
+        self._wait_target(context.object_id,min(context.deadline,time.monotonic()+
+            float(self.config.get('feedback_timeout',15.))),lambda d,p:
+            self.payload_at_cup(self.last_scene,p))
         slot=self.slots.get(zone,0)
         region=None;polygon=None
         landing_kind='collection'
@@ -490,12 +541,13 @@ class SerialMissionRuntime:
                 float(self.config.get('feedback_timeout',15.))),lambda d,p:
                 inside(p)
                 and abs(p[2]-(support+height))<=tolerance
-                and math.dist(p,[self.arm_pose[0],self.arm_pose[1],self.arm_pose[2]-self.geometry.cup_offset])>self.geometry.cup_radius)
+                and math.dist(p,[self.arm_pose[0],self.arm_pose[1],self.arm_pose[2]-self.geometry.cup_offset])>self.geometry.cup_radius,
+                point_of=lambda d:self.geometry.point(d,require_fit=False),stable_mm=tolerance)
         except TimeoutError:
             return ActionResult(context,Outcome.UNKNOWN,'release commanded; correct final region not observed')
         self.held=None;self.held_label='';self.selected_target=None
         self.zone=None
-        self.empty_seen=True;self.slots[zone]=slot+1
+        self.slots[zone]=slot+1
         self.move('empty_travel',self.geometry.values['empty_travel_pose_mm'],context.deadline)
         self.active('empty')
         self.event('placement_confirmed',object_id=context.object_id,zone=zone,slot=slot,point_mm=point,
