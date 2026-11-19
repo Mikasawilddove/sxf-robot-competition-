@@ -1,0 +1,32 @@
+<launch>
+  <!-- Minimal field stack: no camera driver, arm driver, command source or task. -->
+  <arg name="workspace_root" default="/home/spark/SUAT/spark"/>
+  <arg name="map_file"/>
+  <arg name="settle_initialization" default="false"/>
+  <arg name="initial_pose_x"/>
+  <arg name="initial_pose_y"/>
+  <arg name="initial_pose_a"/>
+  <arg name="initial_cov_xx"/>
+  <arg name="initial_cov_yy"/>
+  <arg name="initial_cov_aa"/>
+  <include file="$(find spark_bringup)/launch/driver_bringup.launch">
+    <arg name="start_base" value="true"/>
+    <arg name="start_camera" value="false"/>
+    <arg name="enable_arm_tel" value="false"/>
+    <arg name="arm_type_tel" value="uarm"/>
+    <arg name="camera_type_tel" value="d435"/>
+    <arg name="lidar_type_tel" value="ydlidar_g2"/>
+  </include>
+  <include file="$(find ydlidar_g2)/launch/lidar.launch"/>
+  <include file="$(arg workspace_root)/src/suat_mission/launch/localization_record.launch">
+    <arg name="workspace_root" value="$(arg workspace_root)"/>
+    <arg name="map_file" value="$(arg map_file)"/>
+    <arg name="settle_initialization" value="$(arg settle_initialization)"/>
+    <arg name="initial_pose_x" value="$(arg initial_pose_x)"/>
+    <arg name="initial_pose_y" value="$(arg initial_pose_y)"/>
+    <arg name="initial_pose_a" value="$(arg initial_pose_a)"/>
+    <arg name="initial_cov_xx" value="$(arg initial_cov_xx)"/>
+    <arg name="initial_cov_yy" value="$(arg initial_cov_yy)"/>
+    <arg name="initial_cov_aa" value="$(arg initial_cov_aa)"/>
+  </include>
+</launch>

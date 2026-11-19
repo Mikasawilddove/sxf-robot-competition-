@@ -1,0 +1,34 @@
+# 复制到data/calibration/field_20261117/pickup_geometry_active.yaml后填写现场值。
+# null是未知，禁止直接作为运行文件。候选阈值不是实物验收结论。
+calibration_id: ''
+arm_bounds_mm: null # [xmin,xmax,ymin,ymax,zmin,zmax]，固件XYZ参考点
+reliable_work_area_mm: null # [xmin,xmax,ymin,ymax]，已验证精度的子工作区
+support_z_mm: null # 地垫平面在机械臂坐标中的Z
+cup_offset_mm: null # 固件参考点Z减去物理吸盘接触面Z；只加一次
+cup_radius_mm: null # 真实吸盘半径
+arm_yaw_in_base_rad: null # 机械臂+X相对底盘前向的实测安装角
+observation_pose_mm: null # 不遮挡取物区的空载观察姿态
+board_observation_pose_mm: null # 与保存的板面四角对应的观察姿态
+hold_observation_pose_mm: null # 可选；抬升后为持物观测避挡的姿态
+transport_pose_mm: null # 持物后真实可用的车内运输姿态
+empty_travel_pose_mm: null # 放下后、行车前的空载姿态
+approach_offset_mm: 40.0
+lift_offset_mm: 50.0
+release_bottom_clearance_mm: 100.0 # 用户指定：名义蛋糕底部离地10cm直接松泵
+object_height_mm: {cake: 100.0, clock: 100.0, teddybear: 100.0, banana: 100.0}
+object_width_mm: {cake: 100.0, clock: 100.0, teddybear: 100.0, banana: 100.0}
+drop_slots_arm_mm: {A: [], B: [], C: [], D: []} # 每槽[x,y]，各区实际放置站的机械臂坐标
+drop_regions_arm_mm: {A: null, B: null, C: null, D: null} # 内沿[xmin,xmax,ymin,ymax]
+drop_support_z_mm: {} # 非地垫面才按区覆盖
+# 首选分高度平面模型；四系数顺序kx,bx,ky,by，X=kx*v+bx,Y=ky*u+by。
+# 每项还需top_z_mm、pixel_roi。必须从实际标定导入，不能移用普通块模型给蛋糕。
+plane_models: {}
+# RGB-D可选对照/持物体积观测；刚体旋转+mm平移，禁止将一般仿射当旋转。
+camera_to_arm_mm: null
+# 下列沿用候选参数，可按现场结果修改，不是新增验收标准。
+max_top_tilt_deg: 15.0
+height_tolerance_mm: 12.0
+plane_residual_mm: 5.0
+holding_position_tolerance_mm: 25.0
+gripper_min_rays: 30
+gripper_free_fraction: 0.8

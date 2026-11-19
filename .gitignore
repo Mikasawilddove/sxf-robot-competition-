@@ -21,3 +21,10 @@ __pycache__/
 *.bag
 *.db3
 *.mcap
+
+# Field data, templates and generated ROS workspace output
+/data/
+/reports/
+/devel/
+/src/suat_mission/config/selected_map.yaml
+/src/suat_mission/assets/templates/

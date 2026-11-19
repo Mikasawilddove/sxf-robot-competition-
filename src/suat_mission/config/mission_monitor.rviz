@@ -1,0 +1,34 @@
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Class: rviz/Map
+      Name: Map
+      Enabled: true
+      Topic: /map
+      Alpha: 0.8
+    - Class: rviz/LaserScan
+      Name: Laser scan
+      Enabled: true
+      Topic: /scan
+      Color Transformer: FlatColor
+      Color: 255; 40; 40
+      Style: Points
+      Size (Pixels): 3
+    - Class: rviz/RobotModel
+      Name: Robot
+      Enabled: true
+      Robot Description: robot_description
+  Enabled: true
+  Global Options:
+    Fixed Frame: map
+    Background Color: 48; 48; 48
+    Frame Rate: 15
+  Tools:
+    - Class: rviz/Interact
+    - Class: rviz/MoveCamera
+  Views:
+    Current:
+      Class: rviz/TopDownOrtho
+      Name: Top down
+      Scale: 125
+      Target Frame: map

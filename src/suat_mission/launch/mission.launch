@@ -1,0 +1,24 @@
+<launch>
+  <!-- Sensors/localization and the shared mission-owned navigation stack run first. -->
+  <arg name="config" default="$(find suat_mission)/config/mission.yaml"/>
+  <arg name="workspace_root" default="/home/spark/SUAT/spark"/>
+  <arg name="navigation_speed" default="slow"/>
+  <arg name="geometry_file" default="$(arg workspace_root)/data/calibration/field_20261117/pickup_geometry_visual_20261119.yaml"/>
+  <arg name="instances_topic" default="/suat/perception/grasp_instances"/>
+  <arg name="start_grasp_observer" default="true"/>
+  <arg name="start_perception" default="false"/>
+  <!-- B-line owns this adapter; enable after its launch file is delivered. -->
+  <include if="$(arg start_perception)" file="$(find suat_mission)/launch/field_perception.launch"/>
+  <node if="$(arg start_grasp_observer)" pkg="suat_mission" type="mission_scene_node.py" name="suat_mission_scene" output="screen">
+    <param name="workspace_root" value="$(arg workspace_root)"/>
+    <param name="geometry_file" value="$(arg geometry_file)"/>
+  </node>
+  <node pkg="suat_mission" type="mission_node.py" name="suat_mission" output="screen" clear_params="true">
+    <rosparam command="load" file="$(arg config)"/>
+    <param name="source_config_file" value="$(arg config)"/>
+    <param name="core_delivery_id" value="20261117_official_bridge_C3"/>
+    <param name="instances_topic" value="$(arg instances_topic)"/>
+    <param name="pickup_geometry_file" value="$(arg geometry_file)"/>
+    <param name="navigation_speed" value="$(arg navigation_speed)"/>
+  </node>
+</launch>

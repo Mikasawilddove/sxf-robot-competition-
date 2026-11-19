@@ -1,0 +1,31 @@
+<launch>
+  <arg name="workspace_root" default="/home/spark/SUAT/spark"/>
+  <arg name="rollout_candidate" default="false"/>
+  <!-- Reuse running localization/drivers. Never starts a mission or arm driver.
+       The output gate starts DISARMED and creates no /cmd_vel publisher. -->
+  <node pkg="nodelet" type="nodelet" name="suat_navigation_nodelet_manager" args="manager" required="true"/>
+  <node pkg="nodelet" type="nodelet" name="suat_navigation_smoother"
+        args="load follower_velocity_smoother/VelocitySmootherNodelet suat_navigation_nodelet_manager" required="true">
+    <param name="speed_lim_v" value="0.08"/>
+    <param name="speed_lim_w" value="0.30"/>
+    <param name="accel_lim_v" value="0.20"/>
+    <param name="accel_lim_w" value="0.60"/>
+    <param name="decel_factor" value="1.0"/>
+    <param name="frequency" value="20.0"/>
+    <param name="robot_feedback" value="1"/>
+    <remap from="suat_navigation_smoother/raw_cmd_vel" to="/suat/navigation/raw_cmd_vel"/>
+    <remap from="suat_navigation_smoother/smooth_cmd_vel" to="/suat/navigation/smoothed_cmd_vel"/>
+    <remap from="suat_navigation_smoother/odometry" to="/odom"/>
+    <remap from="suat_navigation_smoother/robot_cmd_vel" to="/spark_base/command/velocity"/>
+  </node>
+  <node pkg="move_base" type="move_base" name="move_base" output="screen" required="true" clear_params="true">
+    <rosparam file="$(find suat_mission)/config/navigation_test.yaml" command="load"/>
+    <rosparam if="$(arg rollout_candidate)" file="$(find suat_mission)/config/navigation_rollout_candidate.yaml" command="load"/>
+    <remap from="cmd_vel" to="/suat/navigation/raw_cmd_vel"/>
+  </node>
+  <node pkg="suat_mission" type="navigation_gate_node.py" name="suat_navigation_gate" output="screen" required="true">
+    <param name="workspace_root" value="$(arg workspace_root)"/>
+    <param name="profile" value="dwa_baseline_first_trial_failed"/>
+    <param if="$(arg rollout_candidate)" name="profile" value="rollout_candidate_not_field_validated"/>
+  </node>
+</launch>

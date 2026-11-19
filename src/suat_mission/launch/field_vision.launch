@@ -1,0 +1,20 @@
+<launch>
+  <!-- Read-only field-test settings; does not start drivers or control motion. -->
+  <arg name="raw_output" default="/suat/experimental_objects" />
+  <arg name="top_output" default="/suat/experimental_top_objects" />
+  <node pkg="suat_mission" type="experimental_detector.py" name="suat_experimental_detector" output="screen">
+    <param name="banana_saturation_min" value="55" />
+    <param name="output_topic" value="$(arg raw_output)" />
+    <rosparam param="templates" subst_value="true">
+      banana: ["$(find suat_mission)/assets/templates/banana.png"]
+      cake: ["$(find suat_mission)/assets/templates/cake.png", "$(find suat_mission)/assets/templates/cake_rule_reference.png"]
+      clock: ["$(find suat_mission)/assets/templates/clock.png"]
+      teddybear: ["$(find suat_mission)/assets/templates/teddybear.png"]
+    </rosparam>
+  </node>
+  <node pkg="suat_mission" type="experimental_surface_filter.py" name="suat_experimental_surface_filter" output="screen">
+    <param name="objects_topic" value="$(arg raw_output)" />
+    <param name="output_topic" value="$(arg top_output)" />
+    <param name="use_reference_plane" value="true" />
+  </node>
+</launch>

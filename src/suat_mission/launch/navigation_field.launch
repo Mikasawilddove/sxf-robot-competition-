@@ -1,0 +1,49 @@
+<launch>
+  <arg name="workspace_root" default="/home/spark/SUAT/spark"/>
+  <arg name="rollout_candidate" default="true"/>
+  <arg name="speed_profile" default="slow"/>
+  <arg name="navigation_owner" default="/suat_field_navigation"/>
+  <arg name="max_v" default="0.08"/>
+  <arg name="max_w" default="0.30"/>
+  <arg name="accel_v" default="0.20"/>
+  <arg name="accel_w" default="0.60"/>
+  <!-- Reuse running localization/drivers. Never starts a mission or arm driver.
+       The output gate starts DISARMED and creates no /cmd_vel publisher. -->
+  <node pkg="nodelet" type="nodelet" name="suat_navigation_nodelet_manager" args="manager" required="true"/>
+  <node pkg="nodelet" type="nodelet" name="suat_navigation_smoother"
+        args="load follower_velocity_smoother/VelocitySmootherNodelet suat_navigation_nodelet_manager" required="true">
+    <param name="speed_lim_v" value="$(arg max_v)"/>
+    <param name="speed_lim_w" value="$(arg max_w)"/>
+    <param name="accel_lim_v" value="$(arg accel_v)"/>
+    <param name="accel_lim_w" value="$(arg accel_w)"/>
+    <param name="decel_factor" value="1.0"/>
+    <param name="frequency" value="20.0"/>
+    <param name="robot_feedback" value="1"/>
+    <remap from="suat_navigation_smoother/raw_cmd_vel" to="/suat/navigation/raw_cmd_vel"/>
+    <remap from="suat_navigation_smoother/smooth_cmd_vel" to="/suat/navigation/smoothed_cmd_vel"/>
+    <remap from="suat_navigation_smoother/odometry" to="/odom"/>
+    <remap from="suat_navigation_smoother/robot_cmd_vel" to="/spark_base/command/velocity"/>
+  </node>
+  <node pkg="move_base" type="move_base" name="move_base" output="screen" required="true" clear_params="true">
+    <rosparam file="$(find suat_mission)/config/navigation_test.yaml" command="load"/>
+    <rosparam if="$(arg rollout_candidate)" file="$(find suat_mission)/config/navigation_rollout_candidate.yaml" command="load"/>
+    <param name="DWAPlannerROS/max_vel_x" value="$(arg max_v)" type="double"/>
+    <param name="DWAPlannerROS/max_vel_trans" value="$(arg max_v)" type="double"/>
+    <param name="DWAPlannerROS/max_vel_theta" value="$(arg max_w)" type="double"/>
+    <param name="DWAPlannerROS/acc_lim_x" value="$(arg accel_v)" type="double"/>
+    <param name="DWAPlannerROS/acc_lim_trans" value="$(arg accel_v)" type="double"/>
+    <param name="DWAPlannerROS/acc_lim_theta" value="$(arg accel_w)" type="double"/>
+    <param name="DWAPlannerROS/latch_xy_goal_tolerance" value="false" type="bool"/>
+    <param name="DWAPlannerROS/scaling_speed" value="$(arg max_v)" type="double"/>
+    <param name="oscillation_timeout" value="20.0" type="double"/>
+    <param name="controller_patience" value="5.0" type="double"/>
+    <remap from="cmd_vel" to="/suat/navigation/raw_cmd_vel"/>
+  </node>
+  <node pkg="suat_mission" type="navigation_gate_node.py" name="suat_navigation_gate" output="screen" required="true">
+    <param name="workspace_root" value="$(arg workspace_root)"/>
+    <param name="mode" value="field"/>
+    <param name="speed_profile" value="$(arg speed_profile)"/>
+    <param name="navigation_owner" value="$(arg navigation_owner)"/>
+    <param name="profile" value="field_rollout_candidate_not_field_validated"/>
+  </node>
+</launch>

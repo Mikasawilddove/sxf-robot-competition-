@@ -1,0 +1,165 @@
+"""Actual RGB-D surfaces and orange calibration-reference observations.
+
+The affine DLT is the robot's existing baseline, not a rigid camera transform.
+All returned coordinates retain that provenance. No class box becomes a top
+face without depth-plane support.
+"""
+import math
+import cv2
+import numpy as np
+
+from suat_mission.manipulation.pickup_geometry import GeometryUnavailable,fit_top_surface
+
+
+class FieldGraspGeometry:
+    def __init__(self,geometry):
+        self.geometry=geometry
+        self.a=np.asarray(geometry.values['legacy_camera_A'],dtype=float).reshape(3,3)
+        self.b=np.asarray(geometry.values['legacy_camera_B_mm'],dtype=float)
+        self.initial_b=self.b.copy();self.samples=[];self.frozen=False
+        self._apply()
+
+    def _apply(self):
+        inverse=np.linalg.inv(self.a)
+        self.geometry.values['camera_to_arm_mm']=np.column_stack((inverse,-inverse@self.b)).tolist()
+        self.geometry.values['geometry_method']='affine_depth_baseline'
+
+    @staticmethod
+    def camera_points(depth,k,stride=1):
+        yy,xx=np.mgrid[0:depth.shape[0]:stride,0:depth.shape[1]:stride]
+        z=depth[::stride,::stride].astype(float)
+        valid=np.isfinite(z)&(z>0)
+        return np.column_stack(((xx[valid]-k[0,2])*z[valid]/k[0,0],
+                                (yy[valid]-k[1,2])*z[valid]/k[1,1],z[valid]))
+
+    def floor(self,depth,k):
+        camera=self.camera_points(depth,k,8)
+        points=(camera-self.b)@np.linalg.inv(self.a).T
+        prior=self.geometry.support_z
+        points=points[(points[:,2]>prior-150.)&(points[:,2]<prior+100.)]
+        if len(points)<100:raise GeometryUnavailable('floor is not visible in aligned depth')
+        rng=np.random.RandomState(7);candidates=[]
+        residual=float(self.geometry.values.get('plane_residual_mm',5.))
+        cosine=math.cos(math.radians(float(self.geometry.values.get('max_top_tilt_deg',15.))))
+        for _ in range(40):
+            p,q,r=points[rng.choice(len(points),3,replace=False)]
+            n=np.cross(q-p,r-p);length=np.linalg.norm(n)
+            if length<1e-8 or abs(n[2])/length<cosine:continue
+            n/=length;mask=abs((points-p)@n)<=residual
+            if mask.sum()>=max(100,len(points)*.12):
+                candidates.append((float(np.median(points[mask,2])),int(mask.sum())))
+        if not candidates:raise GeometryUnavailable('no supported floor plane; height remains unknown')
+        return min(candidates,key=lambda p:p[0])[0]
+
+    def observe_tool(self,image,depth,k,active):
+        pose=active.get('arm_pose_mm')
+        if not pose:return {'state':'unknown','reason':'no measured arm pose'}
+        predicted=self.a@np.asarray(pose)+self.b
+        if predicted[2]<=0:return {'state':'unknown','reason':'tool outside view'}
+        uv=np.array([k[0,0]*predicted[0]/predicted[2]+k[0,2],k[1,1]*predicted[1]/predicted[2]+k[1,2]])
+        hsv=cv2.cvtColor(image,cv2.COLOR_BGR2HSV)
+        mask=cv2.inRange(hsv,np.array([4,100,60],np.uint8),np.array([25,255,255],np.uint8))
+        mask=cv2.morphologyEx(mask,cv2.MORPH_OPEN,np.ones((3,3),np.uint8))
+        contours=cv2.findContours(mask,cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE)[-2]
+        options=[]
+        for contour in contours:
+            area=cv2.contourArea(contour);x,y,w,h=cv2.boundingRect(contour)
+            if not 30<=area<=3000 or not .4<=w/max(h,1)<=2.5 or area/(w*h)<.65:continue
+            moment=cv2.moments(contour)
+            if not moment['m00']:continue
+            u,v=moment['m10']/moment['m00'],moment['m01']/moment['m00']
+            distance=float(np.linalg.norm(np.array([u,v])-uv))
+            if distance>120:continue
+            px,py=int(round(u)),int(round(v))
+            patch=depth[max(0,py-3):py+4,max(0,px-3):px+4]
+            valid=patch[np.isfinite(patch)&(patch>0)]
+            if len(valid)<12:continue
+            d=float(np.median(valid))
+            if abs(d-predicted[2])>120.:continue
+            camera=np.array([(u-k[0,2])*d/k[0,0],(v-k[1,2])*d/k[1,1],d])
+            options.append((distance,camera,[float(u),float(v)]))
+        options.sort(key=lambda item:item[0])
+        if not options or (len(options)>1 and options[1][0]-options[0][0]<15.):
+            return {'state':'unknown','reason':'orange reference not uniquely observed'}
+        _,camera,pixel=options[0]
+        if active.get('phase','').startswith('calibration_view') and not self.frozen:
+            if not self.samples or min(math.dist(pose,p) for p,c in self.samples)>=25.:
+                self.samples.append((list(pose),camera.tolist()))
+            if len(self.samples)>=2:
+                offsets=np.array([np.asarray(c)-self.a@np.asarray(p) for p,c in self.samples])
+                fitted=offsets.mean(axis=0);error=float(np.max(np.linalg.norm(offsets-fitted,axis=1)))
+                if error<=float(self.geometry.values.get('calibration_pair_residual_mm',10.)):
+                    self.b=fitted;self.frozen=True;self._apply()
+                else:return {'state':'unknown','reason':'two measured references disagree','residual_mm':error}
+        measured=np.linalg.solve(self.a,camera-self.b)
+        cup=measured-[0.,0.,self.geometry.cup_offset]
+        return {'state':'observed','reference':'orange_plate_center_as_legacy_dlt',
+                'pixel':pixel,'reference_arm_mm':measured.tolist(),'cup_point_arm_mm':cup.tolist(),
+                'measured_pose_residual_mm':float(np.linalg.norm(measured-np.asarray(pose)))}
+
+    def calibration(self):
+        return {'status':'translation_refined' if self.frozen else 'baseline_not_refined',
+                'samples':len(self.samples),'legacy_camera_B_mm':self.b.tolist(),
+                'reference_pairs':[{'joint_fk_reference_arm_mm':p,'observed_reference_camera_mm':c} for p,c in self.samples],
+                'translation_change_mm':(self.b-self.initial_b).tolist(),
+                'physical_accuracy':'NOT_INDEPENDENTLY_VERIFIED'}
+
+    def surface(self,depth,k,bbox,label,floor,active,tool):
+        carrying=(active.get('object_id') and active.get('label')==label and active.get('phase') in
+                  ('lift','hold_view','transport','carrying','observe_placement','place_approach',
+                   'release_height','withdraw','verify_placement'))
+        expected=None if carrying else floor+(200. if label=='cake' else 100.)
+        aligning=active.get('label')==label and active.get('phase') in ('approach','align_tool','contact')
+        surface=fit_top_surface(depth,k,bbox,self.geometry,label,expected_top_z_mm=expected,require_fit=not (carrying or aligning))
+        surface.update(support_z_mm=floor,geometry_revision=2 if self.frozen else 1)
+        if carrying and tool.get('state')=='observed':
+            cup=np.asarray(tool['cup_point_arm_mm']);n=np.asarray(surface['plane_normal_arm'])
+            point=cup-n*(n@cup-surface['plane_offset_arm_mm'])
+            polygon=np.asarray(surface['support_polygon_arm_mm'],np.float32)[:,:2]
+            if cv2.pointPolygonTest(polygon.reshape(-1,1,2),tuple(point[:2].astype(float)),False)>=0:
+                surface['attachment_point_arm_mm']=point.tolist()
+        return surface
+
+    def placement(self,image,depth,k,active,objects,floor):
+        zone=active.get('zone')
+        if not zone or active.get('phase')!='observe_placement':return None
+        widths=self.geometry.values.get('object_width_mm',{})
+        half_width=float(widths.get(active.get('label'),100.))/2.
+        margin=math.sqrt(2)*half_width
+        hsv=cv2.cvtColor(image,cv2.COLOR_BGR2HSV)
+        mask=cv2.inRange(hsv,np.array([0,90,60],np.uint8),np.array([10,255,255],np.uint8))
+        mask|=cv2.inRange(hsv,np.array([170,90,60],np.uint8),np.array([179,255,255],np.uint8))
+        camera=self.camera_points(depth,k)
+        valid=np.isfinite(depth)&(depth>0)
+        arm=np.zeros((*depth.shape,3),float);arm[valid]=(camera-self.b)@np.linalg.inv(self.a).T
+        mask[(~valid)|(abs(arm[:,:,2]-floor)>12.)]=0
+        contours=cv2.findContours(mask,cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE)[-2]
+        if not contours:return None
+        contour=max(contours,key=cv2.contourArea)
+        if cv2.contourArea(contour)<500:return None
+        boundary=contour.reshape(-1,2);polygon=arm[boundary[:,1],boundary[:,0],:2].astype(np.float32)
+        polygon=cv2.convexHull(polygon).reshape(-1,2)
+        lo=polygon.min(axis=0);hi=polygon.max(axis=0);options=[]
+        for x in np.arange(lo[0],hi[0],10.):
+            for y in np.arange(lo[1],hi[1],10.):
+                # The carried block may be rotated inside the measured red floor.
+                if cv2.pointPolygonTest(polygon.reshape(-1,1,2),(float(x),float(y)),True)<margin:continue
+                covered=True
+                for dx in (-half_width,0.,half_width):
+                    for dy in (-half_width,0.,half_width):
+                        cam=self.a@np.array([x+dx,y+dy,floor])+self.b
+                        if cam[2]<=0:covered=False;break
+                        u=int(round(k[0,0]*cam[0]/cam[2]+k[0,2]));v=int(round(k[1,1]*cam[1]/cam[2]+k[1,2]))
+                        if not (0<=u<mask.shape[1] and 0<=v<mask.shape[0] and mask[v,u]):covered=False;break
+                    if not covered:break
+                if not covered:continue
+                occupied=False
+                for obj in objects:
+                    if obj['object_id']==active.get('object_id'):continue
+                    point=obj.get('surface',{}).get('arm_xyz_mm')
+                    other_margin=math.sqrt(2)*float(widths.get(obj['label'],100.))/2.
+                    if point and math.hypot(point[0]-x,point[1]-y)<margin+other_margin:occupied=True;break
+                if not occupied:options.append([float(x),float(y)])
+        options.sort(key=lambda p:math.hypot(p[0]-200.,p[1]))
+        return {'zone':zone,'support_z_mm':floor,'polygon_arm_mm':polygon.tolist(),
+                'candidates_arm_mm':options,'source':'observed_red_floor_surface'}

@@ -1,0 +1,12 @@
+# Candidate evaluated with final output latched zero. Not field validated.
+# Existing planner plugin, trajectory rollout mode; speed caps unchanged.
+DWAPlannerROS:
+  # Restore the upstream obstacle preference weight; collision rejection and
+  # the configured body/inflation geometry remain in the obstacle critic.
+  occdist_scale: 0.01
+  use_dwa: false
+  sim_time: 3.0
+  sim_granularity: 0.01
+  angular_sim_granularity: 0.025
+  min_vel_theta: 0.03
+  vth_samples: 25

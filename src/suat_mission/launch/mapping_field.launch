@@ -1,0 +1,13 @@
+<launch>
+  <!-- Fixed-layout mapping only. Operator keyboard control is opened separately. -->
+  <include file="$(find spark_bringup)/launch/driver_bringup.launch">
+    <arg name="start_base" value="true"/>
+    <arg name="start_camera" value="false"/>
+    <arg name="enable_arm_tel" value="false"/>
+    <arg name="arm_type_tel" value="uarm"/>
+    <arg name="camera_type_tel" value="d435"/>
+    <arg name="lidar_type_tel" value="ydlidar_g2"/>
+  </include>
+  <include file="$(find ydlidar_g2)/launch/lidar.launch"/>
+  <include file="$(find spark_slam)/launch/spark_gmapping.launch"/>
+</launch>

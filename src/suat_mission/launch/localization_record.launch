@@ -1,0 +1,25 @@
+<launch>
+  <arg name="workspace_root" default="/home/spark/SUAT/spark"/>
+  <!-- Localization/recording only: no base, lidar, camera, arm, pump, mission or move_base startup. -->
+  <!-- Supplied by the selected-map Python entrypoints; no independent map default. -->
+  <arg name="map_file"/>
+  <arg name="settle_initialization" default="false"/>
+  <arg name="initial_pose_x" default="0.0"/>
+  <arg name="initial_pose_y" default="0.0"/>
+  <arg name="initial_pose_a" default="0.0"/>
+  <arg name="initial_cov_xx" default="0.25"/>
+  <arg name="initial_cov_yy" default="0.25"/>
+  <arg name="initial_cov_aa" default="0.06853891945"/>
+  <node name="map_server" pkg="map_server" type="map_server" args="$(arg map_file)" output="screen" required="true"/>
+  <include file="$(find spark_navigation)/launch/includes/amcl/3i_lidar_amcl.launch.xml">
+    <arg name="initial_pose_x" value="$(arg initial_pose_x)"/>
+    <arg name="initial_pose_y" value="$(arg initial_pose_y)"/>
+    <arg name="initial_pose_a" value="$(arg initial_pose_a)"/>
+  </include>
+  <param name="amcl/initial_cov_xx" value="$(arg initial_cov_xx)"/>
+  <param name="amcl/initial_cov_yy" value="$(arg initial_cov_yy)"/>
+  <param name="amcl/initial_cov_aa" value="$(arg initial_cov_aa)"/>
+  <node if="$(arg settle_initialization)" name="suat_localization_settler" pkg="suat_mission" type="localization_settler.py" output="screen">
+    <param name="workspace_root" value="$(arg workspace_root)"/>
+  </node>
+</launch>
