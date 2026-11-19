@@ -505,7 +505,7 @@ class RosRobot:
             self._ensure_running()
             self.nav_active = True
         try:
-            report = navigator.execute_leg(item, plan, context=self.active_context)
+            report = navigator.execute_leg(item, plan, context=self.active_context,station_approach=True)
             attempts=[report]
             # Only an idle, released navigation failure may replan once. A stop,
             # stale sensor, ownership fault or uncertain payload never retries.
@@ -515,7 +515,7 @@ class RosRobot:
                 self._ensure_running()
                 if time.monotonic()+navigator.executor_stop_budget()<self.active_context.deadline:
                     plan=make_plan(attempts)
-                    report=navigator.execute_leg(item,plan,context=self.active_context)
+                    report=navigator.execute_leg(item,plan,context=self.active_context,station_approach=True)
                     attempts.append(dict(report))
                     report['attempts']=attempts
             self.last_navigation_result = report

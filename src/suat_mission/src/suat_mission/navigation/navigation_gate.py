@@ -38,6 +38,7 @@ class NavigationGate:
         if not all(math.isfinite(v) for v in (max_v,max_w,max_run)) or not (0 < max_v <= .20 and 0 < max_w <= .60 and 0 < max_run <= 180):
             raise ValueError('invalid candidate navigation limits')
         self.MAX_V,self.MAX_W,self.MAX_RUN=max_v,max_w,max_run
+        self.lease_v,self.lease_w=max_v,max_w
         self.state = 'DISARMED'
         self.reason = 'explicit_arm_required'
         self.token = None
@@ -45,9 +46,13 @@ class NavigationGate:
         self.started = self.heartbeat_at = None
         self.raw = self.smooth = None
 
-    def arm(self, now, fault=None):
+    def arm(self, now, fault=None, caps=None):
         if self.state != 'DISARMED' or fault:
             raise ValueError(fault or 'stop/release required before a new run')
+        v,w=caps if caps is not None else (self.MAX_V,self.MAX_W)
+        if not (0<v<=self.MAX_V and 0<w<=self.MAX_W):
+            raise ValueError('navigation lease limits exceed configured speed')
+        self.lease_v,self.lease_w=v,w
         self.state, self.reason = 'ARMED', 'waiting_for_fresh_navigation_input'
         self.token, self.sequence = uuid.uuid4().hex, -1
         self.started = self.heartbeat_at = now
@@ -73,7 +78,7 @@ class NavigationGate:
             return
         v, w = values[0], values[5]
         if source == 'raw':
-            if v < -1e-6 or v > self.MAX_V + 1e-3 or abs(w) > self.MAX_W + 1e-3:
+            if v < -1e-6 or v > self.lease_v + 1e-3 or abs(w) > self.lease_w + 1e-3:
                 self.stop('planner_limit_mismatch')
                 return
             self.raw = (now, v, w)
@@ -101,7 +106,7 @@ class NavigationGate:
             # Keep the planner/smoother configuration consistent. This independent
             # output bound also covers the factory driver's asymmetric clamp bug.
             self.reason = 'low_speed_navigation'
-            return max(0.0, min(self.MAX_V, self.smooth[1])), max(-self.MAX_W, min(self.MAX_W, self.smooth[2]))
+            return max(0.0, min(self.lease_v, self.smooth[1])), max(-self.lease_w, min(self.lease_w, self.smooth[2]))
         return 0.0, 0.0
 
     def departure_output(self, now, linear, fault=None, angular=0.):

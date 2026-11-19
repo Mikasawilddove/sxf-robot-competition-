@@ -14,6 +14,26 @@ def speed_profile(name):
     return dict(PROFILES[name])
 
 
+def planner_speed_limits(name):
+    profile = speed_profile(name)
+    return {'max_vel_x': profile['linear'], 'max_vel_trans': profile['linear'],
+            'max_vel_theta': profile['angular']}
+
+
+def station_approach_pose(path, distance=.35):
+    """Pose along the approved path, facing the remaining segment to the station."""
+    for a, b in reversed(list(zip(path, path[1:]))):
+        length = math.dist(a, b)
+        if length == 0:
+            continue
+        if length >= distance:
+            fraction = distance/length
+            return [b[0]+fraction*(a[0]-b[0]), b[1]+fraction*(a[1]-b[1]),
+                    math.atan2(b[1]-a[1],b[0]-a[0])]
+        distance -= length
+    return None
+
+
 def leg_timeout(path_length, speed):
     if not math.isfinite(path_length) or not 0 <= path_length <= 8:
         raise ValueError('leg path must be finite and at most 8 m')

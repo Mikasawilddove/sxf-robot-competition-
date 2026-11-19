@@ -2,7 +2,7 @@
 import math
 import threading
 from suat_mission.navigation.navigation_test_geometry import arrival_confirmed, arrival_error
-from suat_mission.navigation.navigation_profiles import path_travel_fault
+from suat_mission.navigation.navigation_profiles import path_travel_fault, planner_speed_limits
 
 
 class NavigationExecutor:
@@ -28,7 +28,7 @@ class NavigationExecutor:
             raise ValueError('navigation cancelled or shutting down')
 
     def execute(self, item, plan, phase='coarse', xy_tolerance=.08, yaw_tolerance=.12,
-                context=None, cancel_distance=None):
+                context=None, cancel_distance=None, controller_speed=None):
         io = self.transport
         report = {'name': item['name'], 'goal': list(item['pose']), 'plan': plan,
                   'motion_goal_sent': False, 'arrival_confirmed': False,
@@ -66,12 +66,19 @@ class NavigationExecutor:
                     io.settle(min(parent_deadline, io.now()+self.STOP_BUDGET)) and io.release())
                 if not report['output_released']:
                     raise ValueError('navigation handoff is not stopped and released')
-                configured = io.configure(xy_tolerance, yaw_tolerance)
                 expected = {'xy_goal_tolerance': xy_tolerance, 'yaw_goal_tolerance': yaw_tolerance}
+                report['tolerances'] = dict(expected)
+                if controller_speed is None:
+                    configured = io.configure(xy_tolerance, yaw_tolerance)
+                else:
+                    limits = planner_speed_limits(controller_speed)
+                    expected.update(limits)
+                    report['controller_speed_profile'] = controller_speed
+                    report['controller_limits'] = limits
+                    configured = io.configure(xy_tolerance, yaw_tolerance, controller_speed=controller_speed)
                 if any(key not in configured or not math.isfinite(float(configured[key]))
                        or abs(float(configured[key])-value) > 1e-8 for key,value in expected.items()):
-                    raise ValueError('planner tolerance readback differs from requested phase')
-                report['tolerances'] = expected
+                    raise ValueError('planner configuration readback differs from requested phase')
                 if cancel_distance is not None and (not math.isfinite(cancel_distance) or
                                                      not .03 <= cancel_distance <= .50):
                     raise ValueError('cancel distance must be .03..0.50 metres')

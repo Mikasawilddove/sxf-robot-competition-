@@ -262,13 +262,18 @@ class Node:
             try:
                 if not self.owner_request(request):raise ValueError('only configured navigation owner may arm')
                 if not self.inputs_clear():raise ValueError('previous navigation inputs are not zero')
-                token = self.gate.arm(time.monotonic(), self.health(True, True))
+                caps=None
+                if self.owner=='/suat_mission' and rospy.get_param('~station_approach',False) is True:
+                    approach=speed_profile('slow')
+                    caps=(approach['linear'],approach['angular'])
+                token = self.gate.arm(time.monotonic(), self.health(True, True),caps=caps)
                 self.start_odom_pose = self.odom[5:8]
                 self.previous_odom_pose=self.start_odom_pose
                 self.travel=0.
                 self.pub = rospy.Publisher('/cmd_vel', Twist, queue_size=1, latch=False)
                 self.has_armed=True
-                return TriggerResponse(True, json.dumps({'token': token}))
+                return TriggerResponse(True, json.dumps({'token':token,'linear_cap_mps':self.gate.lease_v,
+                                                        'angular_cap_radps':self.gate.lease_w}))
             except Exception as exc:
                 if was_disarmed and self.gate.state == 'ARMED':
                     self.gate.stop('output_publisher_creation_failed')
@@ -627,7 +632,9 @@ class Node:
                              'last_echo_coverage':self.egress['last_echo_coverage'],
                              'nonzero_velocity_published':self.egress['nonzero_velocity_published']},
                          'linear_cap_mps': self.gate.MAX_V,
-                        'angular_cap_radps': self.gate.MAX_W})))
+                        'angular_cap_radps': self.gate.MAX_W,
+                        'lease_linear_cap_mps':self.gate.lease_v,
+                        'lease_angular_cap_radps':self.gate.lease_w})))
             count += 1
 
     def shutdown(self):

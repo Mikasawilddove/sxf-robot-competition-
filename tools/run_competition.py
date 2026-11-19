@@ -19,7 +19,8 @@ CAMERA_TOPICS = {
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('scope',choices=('cake-only','full'),nargs='?',default='cake-only')
-    parser.add_argument('--speed',choices=('slow','normal','fast'),default='slow')
+    parser.add_argument('--speed',choices=('slow','normal','fast'),default='fast')
+    parser.add_argument('--planner',choices=('rollout','dwa'),default='rollout')
     parser.add_argument('--at-start-a',action='store_true',
                         help='automatically align at the saved A placement after Enter, before motion')
     parser.add_argument('--geometry',type=Path,help='explicit existing measured/baseline geometry resource')
@@ -62,6 +63,7 @@ def main():
         'official_profile':str(profile) if profile else None,'grasp_xy_source':args.grasp_source,
         'official_files':values.get('official_planar',{}).get('planes',[]),
         'operator_enter_monotonic':entered_at,
+        'navigation_cruise_profile':args.speed,'navigation_planner_mode':args.planner,
         'start_localization_report':str(alignment_report) if alignment_report else None,
         'physical_accuracy':'NOT_TESTED_BY_LOADING'},ensure_ascii=False,indent=2)+'\n',encoding='utf-8')
     print('Grasp XY source: '+args.grasp_source+'; resources: '+str(logs/'resource_selection.json'),flush=True)
@@ -168,20 +170,25 @@ def main():
         print('Automatically aligning Start_A while stopped.',flush=True)
         alignment=restore_start_a(root,alignment_report)
         print('Start_A localization '+alignment['status']+': '+str(alignment_report),flush=True)
-    if nav and (nav.get('owner')!='/suat_mission' or nav.get('speed_profile')!=args.speed
-                or nav.get('mission_keepout') is not True):
+    def desired_navigation(state):
+        return (state and state.get('owner')=='/suat_mission' and state.get('speed_profile')==args.speed
+                and state.get('mission_keepout') is True
+                and {'lease_linear_cap_mps','lease_angular_cap_radps'}<=state.keys()
+                and rospy.get_param('/move_base/DWAPlannerROS/use_dwa',None) is (args.planner=='dwa'))
+
+    if nav and not desired_navigation(nav):
         rospy.ServiceProxy('/suat_navigation_gate/stop',Trigger)()
         rosnode.kill_nodes([n for n in rosnode.get_node_names() if n in
             ('/move_base','/suat_navigation_gate','/suat_navigation_nodelet_manager','/suat_navigation_smoother')])
         rospy.sleep(1.);nav=None
     if nav is None:
-        proc=spawn('navigation',[sys.executable,'tools/start_field_navigation.py','--start','--speed',args.speed,'--owner','mission'])
+        proc=spawn('navigation',[sys.executable,'tools/start_field_navigation.py','--start','--speed',args.speed,
+                                 '--planner',args.planner,'--owner','mission'])
         deadline=time.monotonic()+20.
         while time.monotonic()<deadline:
             if proc.poll() is not None:raise RuntimeError('navigation startup failed: '+str(logs/'navigation.log'))
             nav=message('/suat/navigation/state',1.)
-            if (nav and nav.get('owner')=='/suat_mission' and nav.get('mission_keepout') is True
-                    and nav.get('health') is None):break
+            if desired_navigation(nav) and nav.get('health') is None:break
         else:raise RuntimeError('navigation did not become ready; see '+str(logs))
     old_scene='/suat_mission_scene'
     if old_scene in rosnode.get_node_names():rosnode.kill_nodes([old_scene]);rospy.sleep(.3)

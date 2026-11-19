@@ -19,12 +19,13 @@ from suat_mission.navigation.pickup_keepout import PickupKeepout
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--speed',choices=('slow','normal','fast'),default='slow')
+    parser.add_argument('--planner',choices=('rollout','dwa'),default='rollout')
     parser.add_argument('--owner',choices=('field','mission'),default='field',help='one navigation owner for this stack')
     parser.add_argument('--start',action='store_true')
     parser.add_argument('--describe',action='store_true',help='offline description, no ROS connection')
     args=parser.parse_args();speed=speed_profile(args.speed)
     owner='/suat_mission' if args.owner=='mission' else '/suat_field_navigation'
-    result={'mode':'field','speed':args.speed,'limits':speed,'field_validated':False,'navigation_owner':owner,
+    result={'mode':'field','speed':args.speed,'planner':args.planner,'limits':speed,'field_validated':False,'navigation_owner':owner,
             'output_initially':'DISARMED_NO_CMD_VEL_PUBLISHER','motion_goal_sent':False}
     if args.describe:
         if args.start:parser.error('--describe cannot start nodes')
@@ -49,6 +50,7 @@ def main():
             'workspace_root:='+str(ROOT),'speed_profile:='+args.speed,
             'navigation_owner:='+owner,
             'mission_keepout:='+str(args.owner=='mission').lower(),
+            'rollout_candidate:='+str(args.planner=='rollout').lower(),
             'max_v:='+str(speed['linear']),'max_w:='+str(speed['angular']),
             'accel_v:='+str(speed['accel_linear']),'accel_w:='+str(speed['accel_angular'])])
     return 0

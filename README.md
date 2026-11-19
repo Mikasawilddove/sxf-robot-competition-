@@ -18,10 +18,12 @@
 在具备 ROS 1 Noetic、Spark-I 驱动、realsense2_camera、RViz 及已构建 catkin 工作区的机器人上，从项目根目录运行：
 
 ```bash
-bash tools/run_match.sh cake-only --at-start-a --speed slow
+bash tools/run_match.sh cake-only --at-start-a --speed fast --planner rollout
 ```
 
 将机器人预先摆在已标定的 A 区起点，朝 D。脚本提示后按一次 Enter。脚本自行启动或复用 ROS、定位、RGB-D 相机和导航，在有桌面显示时打开相机预览和 RViz，定位与任务准备通过后自动开始。蛋糕流程依次执行导航、停车读板、取物、运送和放置，并保留结果。启动准备计入本次时间预算。
+
+正式入口默认使用 `fast` 巡航档与 Trajectory Rollout。任务站前约 0.35 m 处停稳后，以 `slow` 完成最后接近。到站以停车后的 0.04 m 和 0.07 rad 容差判定。需要对照模式时可传 `--planner dwa`。速度和精度参数待实机验收。
 
 ## 本地现场资源
 

@@ -20,7 +20,9 @@ import tf2_ros
 
 from suat_mission.navigation.navigation_map import load_binding,verify_map
 from suat_mission.navigation.navigation_gate import goal_is_free
-from suat_mission.navigation.navigation_profiles import speed_profile,leg_timeout,path_travel_fault
+from suat_mission.navigation.navigation_profiles import (
+    speed_profile,leg_timeout,path_travel_fault,planner_speed_limits,station_approach_pose,
+)
 from suat_mission.navigation.navigation_test_geometry import arrival_error,arrival_confirmed
 from suat_mission.navigation.field_routes import validate_route,StaticPlanner
 from suat_mission.navigation.navigation_executor import NavigationExecutor
@@ -202,6 +204,8 @@ class Navigator:
                 raise ValueError('navigation output belongs to another owner')
             if self.keepout is not None and self.state.get('mission_keepout') is not True:
                 raise ValueError('mission navigation requires the central pickup keepout')
+            if self.owner=='/suat_mission' and not {'lease_linear_cap_mps','lease_angular_cap_radps'}<=self.state.keys():
+                raise ValueError('mission navigation requires the per-goal speed gate')
             if (self.state.get('health') is not None or self.state.get('active_goal') is not False
                     or self.state.get('inputs_clear') is not True
                     or self.state.get('state') not in ('DISARMED','LATCHED')):
@@ -211,10 +215,15 @@ class Navigator:
             if self.state.get('linear_cap_mps')!=profile['linear'] or self.state.get('angular_cap_radps')!=profile['angular']:
                 raise ValueError('output speed profile mismatch')
         # Detect partial speed edits before any lease can be opened.
-        params={'/move_base/DWAPlannerROS/max_vel_x':profile['linear'],
-                '/move_base/DWAPlannerROS/max_vel_trans':profile['linear'],
-                '/move_base/DWAPlannerROS/max_vel_theta':profile['angular'],
-                '/suat_navigation_smoother/speed_lim_v':profile['linear'],
+        limits=planner_speed_limits(self.speed)
+        live={key:float(rospy.get_param('/move_base/DWAPlannerROS/'+key,float('nan'))) for key in limits}
+        allowed=[limits]
+        # A retained idle mission stack may still be configured for the last
+        # approach. The stopped executor sets and verifies the next limits.
+        if self.owner=='/suat_mission':allowed.append(planner_speed_limits('slow'))
+        if not any(all(math.isfinite(live[k]) and abs(live[k]-v)<1e-8 for k,v in option.items()) for option in allowed):
+            raise ValueError('planner limits differ from the selected cruise or approach profile')
+        params={'/suat_navigation_smoother/speed_lim_v':profile['linear'],
                 '/suat_navigation_smoother/speed_lim_w':profile['angular']}
         if any(abs(float(rospy.get_param(k,float('nan')))-v)>1e-8 or not math.isfinite(float(rospy.get_param(k,float('nan')))) for k,v in params.items()):
             raise ValueError('planner/smoother limits differ from selected speed')
@@ -291,8 +300,39 @@ class Navigator:
     def executor_stop_budget():
         return NavigationExecutor.STOP_BUDGET
 
+    def _execute_station(self,item,plan,context):
+        cruise=None
+        if self.speed!='slow' and plan['path_length_m']>=.65:
+            approach=station_approach_pose(plan['path_xy'])
+            if approach is not None:
+                try:
+                    cruise_plan=self.plan(self.pose(),approach,self.grid())
+                except NavigationPlanError:
+                    cruise_plan=None  # The original leg can still be followed slowly.
+                if cruise_plan is not None:
+                    entry={'name':item['name']+'__approach','pose':approach}
+                    cruise=self.executor.execute(entry,cruise_plan,context=context,controller_speed=self.speed)
+                    if not cruise['passed']:
+                        return dict(cruise,name=item['name'],goal=list(item['pose']),arrival_confirmed=False,
+                                    cruise=cruise)
+                    try:
+                        plan=self.plan(self.pose(),item['pose'],self.grid())
+                    except NavigationPlanError as exc:
+                        return dict(cruise,name=item['name'],goal=list(item['pose']),passed=False,
+                                    arrival_confirmed=False,error=str(exc),rejected_plan=exc.plan,cruise=cruise)
+        report=self.executor.execute(item,plan,context=context,xy_tolerance=.04,yaw_tolerance=.07,
+                                     controller_speed='slow')
+        if cruise is not None:
+            report['cruise']=cruise
+            report['motion_goal_sent']|=cruise['motion_goal_sent']
+        if report.get('actual_pose'):
+            report['final_error_m'],report['final_yaw_error_rad']=arrival_error(item['pose'],report['actual_pose'])
+        return report
+
     def execute_leg(self,item,plan,cancel_distance=None,context=None,phase='coarse',
-                    xy_tolerance=.08,yaw_tolerance=.12,align_path=False):
+                    xy_tolerance=.08,yaw_tolerance=.12,align_path=False,station_approach=False):
+        if station_approach and (context is None or align_path or cancel_distance is not None):
+            raise ValueError('station approach needs a mission deadline and an ordinary navigation leg')
         if align_path and cancel_distance is not None:
             raise ValueError('entry alignment and distance cancellation require separate trials')
         prefix_report=None
@@ -355,8 +395,13 @@ class Navigator:
                                     passed=False,arrival_confirmed=False,
                                     error='plan after entry turn failed: '+(str(exc) or type(exc).__name__),
                                     entry_alignment=entry_report)
-        report=self.executor.execute(item,plan,context=context,phase=phase,
-            xy_tolerance=xy_tolerance,yaw_tolerance=yaw_tolerance,cancel_distance=cancel_distance)
+        if station_approach:
+            report=self._execute_station(item,plan,context)
+        else:
+            selected='slow' if phase=='align' and self.owner=='/suat_mission' else None
+            report=self.executor.execute(item,plan,context=context,phase=phase,
+                xy_tolerance=xy_tolerance,yaw_tolerance=yaw_tolerance,cancel_distance=cancel_distance,
+                controller_speed=selected)
         if prefix_report is not None:
             report['initial_contact_prefix']=prefix_report
             report['motion_goal_sent']|=prefix_report['motion_command_sent']
@@ -384,6 +429,7 @@ class RosNavigationTransport:
         self.generation=None
         self.terminal=None
         self.sent=False
+        self.controller_speed=None
         self.heartbeat=None
         self.heartbeat_quit=threading.Event()
         self.worker=None
@@ -435,18 +481,34 @@ class RosNavigationTransport:
             self.sleep(.05)
         return False
 
-    def configure(self,xy,yaw_tolerance):
+    def configure(self,xy,yaw_tolerance,controller_speed=None):
         # Dynamic reconfigure is lazy: the offline core never imports ROS libraries.
         from dynamic_reconfigure.client import Client
         client=Client('/move_base/DWAPlannerROS',timeout=2.)
         # The service returns the configuration applied by the server. The
         # parameter topic cache may still contain the preceding leg's values.
-        return client.update_configuration({'xy_goal_tolerance':xy,'yaw_goal_tolerance':yaw_tolerance})
+        changes={'xy_goal_tolerance':xy,'yaw_goal_tolerance':yaw_tolerance}
+        self.controller_speed=controller_speed
+        if controller_speed is not None:changes.update(planner_speed_limits(controller_speed))
+        return client.update_configuration(changes)
 
     def arm(self):
-        result=self.service('arm')
+        key='/suat_navigation_gate/station_approach'
+        mission=self.navigator.owner=='/suat_mission'
+        if mission:rospy.set_param(key,self.controller_speed=='slow')
+        try:
+            result=self.service('arm')
+        finally:
+            if mission and rospy.has_param(key):rospy.delete_param(key)
         if not result.success:raise ValueError('output disabled: '+result.message)
-        return json.loads(result.message)['token']
+        response=json.loads(result.message)
+        if self.controller_speed is not None:
+            profile=speed_profile(self.controller_speed)
+            if (response.get('linear_cap_mps')!=profile['linear']
+                    or response.get('angular_cap_radps')!=profile['angular']):
+                self.stop()
+                raise ValueError('navigation gate did not confirm the requested motion limits')
+        return response['token']
 
     def prepare_heartbeat(self):
         if self.heartbeat is None:
