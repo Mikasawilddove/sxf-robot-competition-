@@ -40,6 +40,10 @@ def main():
     sys.path.insert(0,str(root/'src/suat_mission/src'))
     import yaml
     from suat_mission.automation.mission_console import discard_pending_input, main as run_console
+    from suat_mission.navigation.navigation_profiles import (
+        CONTROLLER_HZ, GLOBAL_PLANNER_PLUGIN, LOCAL_PLANNER_PLUGIN, PLANNER_NAMESPACE,
+        local_planner_settings, planner_profile_matches,
+    )
     from suat_mission.official_calibration import bind_official_geometry
     profile=args.calibration.expanduser() if args.calibration is not None else None
     if profile is not None and not profile.is_absolute():profile=root/profile
@@ -64,6 +68,8 @@ def main():
         'official_files':values.get('official_planar',{}).get('planes',[]),
         'operator_enter_monotonic':entered_at,
         'navigation_cruise_profile':args.speed,'navigation_planner_mode':args.planner,
+        'navigation_cruise_sampling':local_planner_settings(args.planner),
+        'navigation_approach_sampling':local_planner_settings(args.planner,approach=True),
         'start_localization_report':str(alignment_report) if alignment_report else None,
         'physical_accuracy':'NOT_TESTED_BY_LOADING'},ensure_ascii=False,indent=2)+'\n',encoding='utf-8')
     print('Grasp XY source: '+args.grasp_source+'; resources: '+str(logs/'resource_selection.json'),flush=True)
@@ -174,7 +180,10 @@ def main():
         return (state and state.get('owner')=='/suat_mission' and state.get('speed_profile')==args.speed
                 and state.get('mission_keepout') is True
                 and {'lease_linear_cap_mps','lease_angular_cap_radps'}<=state.keys()
-                and rospy.get_param('/move_base/DWAPlannerROS/use_dwa',None) is (args.planner=='dwa'))
+                and rospy.get_param('/move_base/base_global_planner',None)==GLOBAL_PLANNER_PLUGIN
+                and rospy.get_param('/move_base/base_local_planner',None)==LOCAL_PLANNER_PLUGIN
+                and rospy.get_param('/move_base/controller_frequency',None)==CONTROLLER_HZ
+                and planner_profile_matches(rospy.get_param(PLANNER_NAMESPACE,{}),args.planner))
 
     if nav and not desired_navigation(nav):
         rospy.ServiceProxy('/suat_navigation_gate/stop',Trigger)()
@@ -193,6 +202,7 @@ def main():
     old_scene='/suat_mission_scene'
     if old_scene in rosnode.get_node_names():rosnode.kill_nodes([old_scene]);rospy.sleep(.3)
     process=spawn('mission',['roslaunch','suat_mission','mission.launch','navigation_speed:='+args.speed,
+                            'navigation_planner_mode:='+args.planner,
                             'geometry_file:='+str(geometry)])
     deadline=time.monotonic()+15.
     while time.monotonic()<deadline:

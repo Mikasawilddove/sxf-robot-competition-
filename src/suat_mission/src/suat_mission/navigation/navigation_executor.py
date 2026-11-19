@@ -79,6 +79,11 @@ class NavigationExecutor:
                 if any(key not in configured or not math.isfinite(float(configured[key]))
                        or abs(float(configured[key])-value) > 1e-8 for key,value in expected.items()):
                     raise ValueError('planner configuration readback differs from requested phase')
+                if type(configured.get('use_dwa')) is bool:
+                    report['local_planner_mode']='dwa' if configured['use_dwa'] else 'rollout'
+                    report['sampling_readback']={key:configured[key] for key in (
+                        'sim_time','sim_granularity','angular_sim_granularity','vx_samples','vth_samples',
+                        'path_distance_bias','goal_distance_bias','occdist_scale') if key in configured}
                 if cancel_distance is not None and (not math.isfinite(cancel_distance) or
                                                      not .03 <= cancel_distance <= .50):
                     raise ValueError('cancel distance must be .03..0.50 metres')
@@ -127,6 +132,8 @@ class NavigationExecutor:
                     previous = current
                     report.update(action_terminal_state=sample['status'], actual_pose=list(sample['pose']),
                                   linear_mps=sample['linear'], angular_radps=sample['angular'], travel_m=travel)
+                    report['peak_linear_mps']=max(report.get('peak_linear_mps',0.),abs(sample['linear']))
+                    report['peak_angular_radps']=max(report.get('peak_angular_radps',0.),abs(sample['angular']))
                     if cancel_distance is not None and math.dist(current[:2], origin[:2]) >= cancel_distance:
                         io.stop()
                         io.cancel_owned()

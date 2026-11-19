@@ -23,7 +23,15 @@ bash tools/run_match.sh cake-only --at-start-a --speed fast --planner rollout
 
 将机器人预先摆在已标定的 A 区起点，朝 D。脚本提示后按一次 Enter。脚本自行启动或复用 ROS、定位、RGB-D 相机和导航，在有桌面显示时打开相机预览和 RViz，定位与任务准备通过后自动开始。蛋糕流程依次执行导航、停车读板、取物、运送和放置，并保留结果。启动准备计入本次时间预算。
 
-正式入口默认使用 `fast` 巡航档与 Trajectory Rollout。任务站前约 0.35 m 处停稳后，以 `slow` 完成最后接近。到站以停车后的 0.04 m 和 0.07 rad 容差判定。需要对照模式时可传 `--planner dwa`。速度和精度参数待实机验收。
+正式入口的两种局部规划模式共用 Navfn、代价地图、碰撞范围和速度档。默认使用 Trajectory Rollout，DWA 可用下面的命令启动同一任务。
+
+```bash
+bash tools/run_match.sh cake-only --at-start-a --speed fast --planner dwa
+```
+
+`--planner dwa` 按控制周期内可达的速度窗口采样。`--planner rollout` 在预测时域内模拟加速。两种模式均以 `fast` 巡航，接近任务站时停车切到 `slow`。Rollout 在靠近目标时缩短预测时域，以保留直行微调候选。速度和精度仍待实机验收。
+
+只查看两种模式的参数时，可用 `python3 tools/start_field_navigation.py --describe --owner mission --speed fast --planner rollout`，将末尾换成 `dwa` 查看另一组。正式日志会记录每段实际生效的采样参数、里程计速度峰值及最后停稳误差。
 
 ## 本地现场资源
 

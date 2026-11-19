@@ -162,7 +162,8 @@ class RosRobot:
             # Use the same canonical workspace as preparation and map recording.
             root = Path(__file__).resolve().parents[5]
             self._navigator = Navigator(root, self._param('navigation_speed', 'slow'),
-                                        owner='/suat_mission', health_check=self._ensure_running)
+                                        owner='/suat_mission', health_check=self._ensure_running,
+                                        planner_mode=self._param('navigation_planner_mode') or None)
         return self._navigator
 
     def prepare_navigation(self):

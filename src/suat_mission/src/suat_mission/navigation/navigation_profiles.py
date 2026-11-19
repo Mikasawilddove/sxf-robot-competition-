@@ -7,6 +7,55 @@ PROFILES = {
     'fast': {'linear': .20, 'angular': .60, 'accel_linear': .30, 'accel_angular': 1.0},
 }
 
+PLANNER_MODES = ('rollout', 'dwa')
+CONTROLLER_HZ = 10.0
+PLANNER_NAMESPACE = '/move_base/DWAPlannerROS'
+LOCAL_PLANNER_PLUGIN = 'dwa_local_planner/DWAPlannerROS'
+GLOBAL_PLANNER_PLUGIN = 'navfn/NavfnROS'
+
+# Both modes use the same critics and footprint. Sampling differs because
+# the dynamic window covers one control period, while rollout covers a horizon.
+PLANNER_COMMON = {
+    'path_distance_bias': 32.0, 'goal_distance_bias': 24.0, 'occdist_scale': .01,
+    'forward_point_distance': .15, 'min_vel_theta': .03, 'min_vel_trans': .02,
+    'sim_granularity': .01, 'angular_sim_granularity': .025,
+    'vy_samples': 1, 'vth_samples': 25,
+}
+
+
+def local_planner_settings(mode, approach=False, xy_tolerance=.04):
+    if mode == 'rollout':
+        # Noetic bounds forward rollout samples by goal distance / sim_time.
+        # With a 4 cm goal tolerance, 3 s excludes the 0.02 m/s minimum
+        # translation before the goal is accepted. The 1.5 s approach avoids it.
+        horizon=3.
+        if approach:
+            horizon=max(1/CONTROLLER_HZ,min(1.5,.8*xy_tolerance/PLANNER_COMMON['min_vel_trans']))
+        return dict(PLANNER_COMMON, use_dwa=False, sim_time=horizon, vx_samples=11)
+    if mode == 'dwa':
+        return dict(PLANNER_COMMON, use_dwa=True, sim_time=1.2 if approach else 1.7, vx_samples=8)
+    raise ValueError('local planner must be rollout or dwa')
+
+
+def settings_match(actual, expected):
+    for name, value in expected.items():
+        received = actual.get(name)
+        if isinstance(value, bool):
+            if received is not value:
+                return False
+        elif type(received) not in (int, float) or not math.isclose(received,value,rel_tol=1e-8,abs_tol=1e-9):
+            return False
+    return True
+
+
+def planner_profile_matches(actual, mode):
+    """Recognize a cruise setup or the last stopped approach setup."""
+    tolerance=actual.get('xy_goal_tolerance',.04)
+    if type(tolerance) not in (int,float) or not math.isfinite(tolerance) or tolerance<=0:
+        return False
+    return (settings_match(actual,local_planner_settings(mode))
+            or settings_match(actual,local_planner_settings(mode,True,tolerance)))
+
 
 def speed_profile(name):
     if name not in PROFILES:

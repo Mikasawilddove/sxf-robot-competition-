@@ -21,7 +21,9 @@ import tf2_ros
 from suat_mission.navigation.navigation_map import load_binding,verify_map
 from suat_mission.navigation.navigation_gate import goal_is_free
 from suat_mission.navigation.navigation_profiles import (
+    CONTROLLER_HZ, GLOBAL_PLANNER_PLUGIN, LOCAL_PLANNER_PLUGIN, PLANNER_NAMESPACE,
     speed_profile,leg_timeout,path_travel_fault,planner_speed_limits,station_approach_pose,
+    local_planner_settings, planner_profile_matches, settings_match,
 )
 from suat_mission.navigation.navigation_test_geometry import arrival_error,arrival_confirmed
 from suat_mission.navigation.field_routes import validate_route,StaticPlanner
@@ -43,9 +45,10 @@ class NavigationPlanError(ValueError):
 
 
 class Navigator:
-    def __init__(self,root,speed,owner=None,health_check=None):
+    def __init__(self,root,speed,owner=None,health_check=None,planner_mode=None):
         self.owner=owner or rospy.get_name()
         self.health_check=health_check
+        self.planner_mode=planner_mode
         self.binding=load_binding(root);self.speed=speed
         self.keepout=PickupKeepout.load(root,self.binding) if self.owner=='/suat_mission' else None
         footprint=rospy.get_param('/move_base/global_costmap/footprint','[]')
@@ -216,12 +219,18 @@ class Navigator:
                 raise ValueError('output speed profile mismatch')
         # Detect partial speed edits before any lease can be opened.
         limits=planner_speed_limits(self.speed)
-        live={key:float(rospy.get_param('/move_base/DWAPlannerROS/'+key,float('nan'))) for key in limits}
+        live=rospy.get_param(PLANNER_NAMESPACE,{})
+        if self.planner_mode is not None:
+            if (rospy.get_param('/move_base/base_global_planner',None)!=GLOBAL_PLANNER_PLUGIN
+                    or rospy.get_param('/move_base/base_local_planner',None)!=LOCAL_PLANNER_PLUGIN
+                    or rospy.get_param('/move_base/controller_frequency',None)!=CONTROLLER_HZ
+                    or not planner_profile_matches(live,self.planner_mode)):
+                raise ValueError('active ROS navigation does not match the selected local planner profile')
         allowed=[limits]
         # A retained idle mission stack may still be configured for the last
         # approach. The stopped executor sets and verifies the next limits.
         if self.owner=='/suat_mission':allowed.append(planner_speed_limits('slow'))
-        if not any(all(math.isfinite(live[k]) and abs(live[k]-v)<1e-8 for k,v in option.items()) for option in allowed):
+        if not any(settings_match(live,option) for option in allowed):
             raise ValueError('planner limits differ from the selected cruise or approach profile')
         params={'/suat_navigation_smoother/speed_lim_v':profile['linear'],
                 '/suat_navigation_smoother/speed_lim_w':profile['angular']}
@@ -484,13 +493,19 @@ class RosNavigationTransport:
     def configure(self,xy,yaw_tolerance,controller_speed=None):
         # Dynamic reconfigure is lazy: the offline core never imports ROS libraries.
         from dynamic_reconfigure.client import Client
-        client=Client('/move_base/DWAPlannerROS',timeout=2.)
+        client=Client(PLANNER_NAMESPACE,timeout=2.)
         # The service returns the configuration applied by the server. The
         # parameter topic cache may still contain the preceding leg's values.
         changes={'xy_goal_tolerance':xy,'yaw_goal_tolerance':yaw_tolerance}
         self.controller_speed=controller_speed
         if controller_speed is not None:changes.update(planner_speed_limits(controller_speed))
-        return client.update_configuration(changes)
+        mode=self.navigator.planner_mode
+        if mode is not None:
+            changes.update(local_planner_settings(mode,controller_speed=='slow',xy))
+        actual=client.update_configuration(changes)
+        if not settings_match(actual,changes):
+            raise ValueError('local planner did not confirm the stopped-phase settings')
+        return actual
 
     def arm(self):
         key='/suat_navigation_gate/station_approach'

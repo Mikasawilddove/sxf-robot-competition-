@@ -3,6 +3,7 @@
   <arg name="config" default="$(find suat_mission)/config/mission.yaml"/>
   <arg name="workspace_root" default="/home/spark/SUAT/spark"/>
   <arg name="navigation_speed" default="slow"/>
+  <arg name="navigation_planner_mode" default=""/>
   <arg name="geometry_file" default="$(arg workspace_root)/data/calibration/field_20261117/pickup_geometry_visual_20261119.yaml"/>
   <arg name="instances_topic" default="/suat/perception/grasp_instances"/>
   <arg name="start_grasp_observer" default="true"/>
@@ -20,5 +21,6 @@
     <param name="instances_topic" value="$(arg instances_topic)"/>
     <param name="pickup_geometry_file" value="$(arg geometry_file)"/>
     <param name="navigation_speed" value="$(arg navigation_speed)"/>
+    <param name="navigation_planner_mode" value="$(arg navigation_planner_mode)" type="str"/>
   </node>
 </launch>

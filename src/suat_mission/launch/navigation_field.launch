@@ -1,6 +1,9 @@
 <launch>
   <arg name="workspace_root" default="/home/spark/SUAT/spark"/>
   <arg name="rollout_candidate" default="true"/>
+  <arg name="planner_mode" default="legacy"/>
+  <arg name="local_planner_settings" default="{}"/>
+  <arg name="controller_hz" default="10.0"/>
   <arg name="speed_profile" default="slow"/>
   <arg name="navigation_owner" default="/suat_field_navigation"/>
   <arg name="mission_keepout" default="false"/>
@@ -28,6 +31,8 @@
   <node pkg="move_base" type="move_base" name="move_base" output="screen" required="true" clear_params="true">
     <rosparam file="$(find suat_mission)/config/navigation_test.yaml" command="load"/>
     <rosparam if="$(arg rollout_candidate)" file="$(find suat_mission)/config/navigation_rollout_candidate.yaml" command="load"/>
+    <rosparam param="DWAPlannerROS" subst_value="true">$(arg local_planner_settings)</rosparam>
+    <param name="controller_frequency" value="$(arg controller_hz)" type="double"/>
     <param if="$(arg mission_keepout)" name="global_costmap/static_layer/map_topic" value="/suat/navigation/planning_map"/>
     <rosparam if="$(arg mission_keepout)" ns="local_costmap" command="load">
       plugins:
@@ -58,6 +63,6 @@
     <param name="speed_profile" value="$(arg speed_profile)"/>
     <param name="navigation_owner" value="$(arg navigation_owner)"/>
     <param name="mission_keepout" value="$(arg mission_keepout)"/>
-    <param name="profile" value="field_rollout_candidate_not_field_validated"/>
+    <param name="profile" value="field_$(arg planner_mode)"/>
   </node>
 </launch>
