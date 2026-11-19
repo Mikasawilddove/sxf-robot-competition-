@@ -26,6 +26,7 @@ from suat_mission.navigation.field_routes import validate_route,StaticPlanner
 from suat_mission.navigation.navigation_executor import NavigationExecutor
 from suat_mission.contracts import ActionContext
 from suat_mission.navigation.corner_egress import contact_path,contact_handoffs
+from suat_mission.navigation.pickup_keepout import PLANNING_MAP_TOPIC, PickupKeepout
 
 
 def yaw(q):
@@ -44,6 +45,7 @@ class Navigator:
         self.owner=owner or rospy.get_name()
         self.health_check=health_check
         self.binding=load_binding(root);self.speed=speed
+        self.keepout=PickupKeepout.load(root,self.binding) if self.owner=='/suat_mission' else None
         footprint=rospy.get_param('/move_base/global_costmap/footprint','[]')
         if footprint not in (None,'','[]',[]):raise ValueError('field validator requires a circular footprint')
         self.radius=float(rospy.get_param('/move_base/global_costmap/robot_radius',.20))+float(rospy.get_param('/move_base/global_costmap/footprint_padding',.02))
@@ -78,7 +80,8 @@ class Navigator:
             return [p.x,p.y,yaw(q)],msg.twist.twist.linear.x,msg.twist.twist.angular.z,time.monotonic()-at
 
     def grid(self):
-        return verify_map(rospy.wait_for_message('/map',OccupancyGrid,timeout=4),self.binding)
+        topic=PLANNING_MAP_TOPIC if self.keepout is not None else '/map'
+        return verify_map(rospy.wait_for_message(topic,OccupancyGrid,timeout=4),self.binding)
 
     @staticmethod
     def stamped(pose):
@@ -97,6 +100,8 @@ class Navigator:
         if (len(start)!=3 or len(goal)!=3 or
                 not all(math.isfinite(v) for v in list(start)+list(goal))):
             reject('invalid navigation pose')
+        if self.keepout is not None and min(self.keepout.distance(start),self.keepout.distance(goal))<=self.radius:
+            reject('start or goal body overlaps central pickup keepout')
         start_clear=goal_is_free(grid,*start[:2],radius=self.radius)
         if not goal_is_free(grid,*goal[:2],radius=max(.25,self.radius)):
             reject('goal body footprint is blocked on selected map')
@@ -131,6 +136,9 @@ class Navigator:
                            contact_handoff=handoff)
             if length>8:
                 raise ValueError('one leg exceeds 8 m')
+            if self.keepout is not None and not all(self.keepout.segment_clear(a,b,self.radius)
+                                                    for a,b in zip(points,points[1:])):
+                raise ValueError('live path crosses central pickup keepout')
             body_clear=all(checker.segment_free(a,b) for a,b in zip(points,points[1:]))
             recovery=None
             if not body_clear:
@@ -192,6 +200,8 @@ class Navigator:
             if self.state is None or time.monotonic()-self.state_at>.7:raise ValueError('fresh output state missing')
             if self.state.get('owner')!=self.owner:
                 raise ValueError('navigation output belongs to another owner')
+            if self.keepout is not None and self.state.get('mission_keepout') is not True:
+                raise ValueError('mission navigation requires the central pickup keepout')
             if (self.state.get('health') is not None or self.state.get('active_goal') is not False
                     or self.state.get('inputs_clear') is not True
                     or self.state.get('state') not in ('DISARMED','LATCHED')):

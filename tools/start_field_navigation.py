@@ -12,6 +12,8 @@ import xmlrpc.client
 ROOT=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT/'src/suat_mission/src'))
 from suat_mission.navigation_profiles import speed_profile
+from suat_mission.navigation.navigation_map import load_binding
+from suat_mission.navigation.pickup_keepout import PickupKeepout
 
 
 def main():
@@ -41,9 +43,12 @@ def main():
     print(json.dumps(result,indent=2),flush=True)
     if not ready:return 2
     if args.start:
+        if args.owner=='mission':
+            PickupKeepout.load(ROOT,load_binding(ROOT))
         return subprocess.call(['roslaunch',str(ROOT/'src/suat_mission/launch/navigation_field.launch'),
             'workspace_root:='+str(ROOT),'speed_profile:='+args.speed,
             'navigation_owner:='+owner,
+            'mission_keepout:='+str(args.owner=='mission').lower(),
             'max_v:='+str(speed['linear']),'max_w:='+str(speed['angular']),
             'accel_v:='+str(speed['accel_linear']),'accel_w:='+str(speed['accel_angular'])])
     return 0

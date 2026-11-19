@@ -168,7 +168,8 @@ def main():
         print('Automatically aligning Start_A while stopped.',flush=True)
         alignment=restore_start_a(root,alignment_report)
         print('Start_A localization '+alignment['status']+': '+str(alignment_report),flush=True)
-    if nav and (nav.get('owner')!='/suat_mission' or nav.get('speed_profile')!=args.speed):
+    if nav and (nav.get('owner')!='/suat_mission' or nav.get('speed_profile')!=args.speed
+                or nav.get('mission_keepout') is not True):
         rospy.ServiceProxy('/suat_navigation_gate/stop',Trigger)()
         rosnode.kill_nodes([n for n in rosnode.get_node_names() if n in
             ('/move_base','/suat_navigation_gate','/suat_navigation_nodelet_manager','/suat_navigation_smoother')])
@@ -179,7 +180,8 @@ def main():
         while time.monotonic()<deadline:
             if proc.poll() is not None:raise RuntimeError('navigation startup failed: '+str(logs/'navigation.log'))
             nav=message('/suat/navigation/state',1.)
-            if nav and nav.get('owner')=='/suat_mission' and nav.get('health') is None:break
+            if (nav and nav.get('owner')=='/suat_mission' and nav.get('mission_keepout') is True
+                    and nav.get('health') is None):break
         else:raise RuntimeError('navigation did not become ready; see '+str(logs))
     old_scene='/suat_mission_scene'
     if old_scene in rosnode.get_node_names():rosnode.kill_nodes([old_scene]);rospy.sleep(.3)

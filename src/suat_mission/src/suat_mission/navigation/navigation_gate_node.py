@@ -22,6 +22,7 @@ from std_srvs.srv import Trigger, TriggerResponse
 
 from suat_mission.navigation.navigation_gate import NavigationGate, navigation_clients_fault, motion_bounds_fault
 from suat_mission.navigation.navigation_map import load_binding, verify_map
+from suat_mission.navigation.pickup_keepout import PLANNING_MAP_TOPIC, PickupKeepout
 from suat_mission.navigation.navigation_profiles import speed_profile, path_travel_fault
 from suat_mission.navigation.corner_egress import (
     DISTANCE, SPEED, SweepBlocked, anchor_check, check_rear_clearance,
@@ -71,6 +72,16 @@ class Node:
         self.map_fault = 'map_not_verified'
         self.binding = load_binding(Path(rospy.get_param('~workspace_root')))
         self.workspace_root = Path(rospy.get_param('~workspace_root'))
+        self.keepout = None
+        self.planning_map_pub = None
+        self.map_xy = None
+        if rospy.get_param('~mission_keepout',False):
+            self.keepout = PickupKeepout.load(self.workspace_root,self.binding)
+            self.keepout_radius = float(rospy.get_param('/move_base/global_costmap/robot_radius',.20)) + float(
+                rospy.get_param('/move_base/global_costmap/footprint_padding',.02))
+            if not math.isfinite(self.keepout_radius) or self.keepout_radius<=0:
+                raise ValueError('invalid footprint radius for central pickup keepout')
+            self.planning_map_pub = rospy.Publisher(PLANNING_MAP_TOPIC,OccupancyGrid,queue_size=1,latch=True)
         self.profile = rospy.get_param('~profile', 'UNKNOWN')
         self.buffer = tf2_ros.Buffer()
         self.listener = tf2_ros.TransformListener(self.buffer)
@@ -163,6 +174,10 @@ class Node:
     def on_map(self, msg):
         try:
             grid=verify_map(msg, self.binding)
+            if self.keepout is not None:
+                grid=self.keepout.mask(grid)
+                planning=OccupancyGrid(header=msg.header,info=msg.info,data=grid['data'])
+                self.planning_map_pub.publish(planning)
             fault = None
         except Exception as exc:
             fault = 'map_binding_failed:' + str(exc)
@@ -184,6 +199,8 @@ class Node:
                     self.graph = (dict(pubs), dict(subs))
                     self.graph_at = self.tf_at = time.monotonic()
                     self.tf_fault = fault
+                    p=transform.transform.translation
+                    self.map_xy=(p.x,p.y)
             except Exception:
                 pass  # The output thread stops on monitor expiry even if this thread blocks.
             self.stopping.wait(.1)
@@ -204,6 +221,9 @@ class Node:
             return 'smoother_owner_mismatch'
         if pubs.get('/map', []) != ['/map_server'] or self.map_fault:
             return self.map_fault or 'map_owner_mismatch'
+        if self.keepout is not None and (pubs.get(PLANNING_MAP_TOPIC,[]) != [rospy.get_name()]
+                                         or '/move_base' not in subs.get(PLANNING_MAP_TOPIC,[])):
+            return 'central_pickup_keepout_map_not_connected'
         clients_fault = navigation_clients_fault(pubs,self.owner)
         if clients_fault:
             return clients_fault
@@ -571,6 +591,15 @@ class Node:
                     v,w=self.gate.departure_output(time.monotonic(),self.egress['command_v'],self.health(),angular=self.egress.get('command_w',0.))
                 else:
                     v,w=self.gate.output(time.monotonic(), self.health())
+                if self.keepout is not None and self.gate.state=='ARMED' and self.map_xy is not None:
+                    # The swept center stays within this radius for the next
+                    # output/TF cycle and the configured braking distance.
+                    speed=max(abs(v),abs(self.odom[3]))
+                    reach=speed*(.15+time.monotonic()-self.tf_at)+speed*speed/(2*self.egress_accel)
+                    if (not all(math.isfinite(p) for p in self.map_xy)
+                            or self.keepout.distance(self.map_xy)<=self.keepout_radius+reach):
+                        self.gate.stop('central_pickup_keepout_swept_footprint')
+                        v=w=0.
                 if self.pub is not None:
                     msg = Twist()
                     msg.linear.x, msg.angular.z = v, w
@@ -583,6 +612,7 @@ class Node:
                         'profile': self.profile,
                         'mode':self.mode,'speed_profile':self.speed_name,'travel_m':self.travel,
                         'owner':self.owner,'inputs_clear':self.inputs_clear(),
+                        'mission_keepout':self.keepout is not None,
                         'active_goal':None if self.goals is None else self.goals[1],
                         'health': self.health(), 'egress':None if self.egress is None else {
                             'id':self.egress['id'], 'status':self.egress['status'], 'distance_m':self.egress['distance'],

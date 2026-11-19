@@ -3,6 +3,7 @@
   <arg name="rollout_candidate" default="true"/>
   <arg name="speed_profile" default="slow"/>
   <arg name="navigation_owner" default="/suat_field_navigation"/>
+  <arg name="mission_keepout" default="false"/>
   <arg name="max_v" default="0.08"/>
   <arg name="max_w" default="0.30"/>
   <arg name="accel_v" default="0.20"/>
@@ -27,6 +28,18 @@
   <node pkg="move_base" type="move_base" name="move_base" output="screen" required="true" clear_params="true">
     <rosparam file="$(find suat_mission)/config/navigation_test.yaml" command="load"/>
     <rosparam if="$(arg rollout_candidate)" file="$(find suat_mission)/config/navigation_rollout_candidate.yaml" command="load"/>
+    <param if="$(arg mission_keepout)" name="global_costmap/static_layer/map_topic" value="/suat/navigation/planning_map"/>
+    <rosparam if="$(arg mission_keepout)" ns="local_costmap" command="load">
+      plugins:
+        - {name: obstacle_layer, type: 'costmap_2d::ObstacleLayer'}
+        - {name: static_layer, type: 'costmap_2d::StaticLayer'}
+        - {name: inflation_layer, type: 'costmap_2d::InflationLayer'}
+      static_layer:
+        enabled: true
+        map_topic: /suat/navigation/planning_map
+        track_unknown_space: true
+        use_maximum: true
+    </rosparam>
     <param name="DWAPlannerROS/max_vel_x" value="$(arg max_v)" type="double"/>
     <param name="DWAPlannerROS/max_vel_trans" value="$(arg max_v)" type="double"/>
     <param name="DWAPlannerROS/max_vel_theta" value="$(arg max_w)" type="double"/>
@@ -44,6 +57,7 @@
     <param name="mode" value="field"/>
     <param name="speed_profile" value="$(arg speed_profile)"/>
     <param name="navigation_owner" value="$(arg navigation_owner)"/>
+    <param name="mission_keepout" value="$(arg mission_keepout)"/>
     <param name="profile" value="field_rollout_candidate_not_field_validated"/>
   </node>
 </launch>
