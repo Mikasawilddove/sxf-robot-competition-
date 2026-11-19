@@ -1,0 +1,23 @@
+# Local secrets and machine-specific files
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.local
+*.local.yaml
+*.local.yml
+# ROS / Python / IDE output
+build/
+install/
+log/
+logs/
+__pycache__/
+*.pyc
+.venv/
+.vscode/
+.idea/
+# Raw bags and local captures
+*.bag
+*.db3
+*.mcap
