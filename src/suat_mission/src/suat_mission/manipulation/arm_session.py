@@ -72,6 +72,7 @@ class ArmSession:
         self.feed = feed
         self.fast_feed=feed
         self.contact_feed=feed
+        self.loaded_feed_limit = None
         self.correction_feed=min(feed,1000.)
         self.correction_tolerance_mm=5.
         self.port = None
@@ -227,18 +228,27 @@ class ArmSession:
         end=min(self.now()+75., deadline) if deadline is not None else self.now()+75.
         ctx = ActionContext(self.run.name, stage, 'arm_pose', '', 0, end)
         self.feed=self.contact_feed if stage in ('contact','lift','release_height') else self.fast_feed
-        if not self.validate_target(xyz,end):raise RuntimeError(stage+': controller IK rejected target')
-        initial=self.read_pose(end)['xyz']
-        if math.dist(initial,xyz)>self.correction_tolerance_mm:
-            self.move(xyz,end-3.)
-        # Long travel may be fast. Small measured corrections retain the only
-        # feed that converged in the field report, inside the same session.
-        self.feed=self.correction_feed
-        result = recover_pose(self, xyz, ctx, tolerance_mm=self.correction_tolerance_mm, max_moves=3,
-                              stop_budget_s=3., max_correction_step_mm=5. if loaded else 10.,
-                              max_command_offset_mm=10. if loaded else 25.)
+        limit = self.loaded_feed_limit if loaded or self.pump_may_be_on else None
+        if limit is not None:
+            self.feed = min(self.feed, limit)
+        travel_feed = self.feed
+        if stage == 'lift' and limit is not None:
+            # One G0 with fresh joint/FK checks, including after stop. Do not
+            # chase an offset by moving the cup sideways or starting a second lift.
+            result = recover_pose(self, xyz, ctx, tolerance_mm=self.correction_tolerance_mm,
+                                  max_moves=1, stop_budget_s=3.)
+        else:
+            if not self.validate_target(xyz,end):raise RuntimeError(stage+': controller IK rejected target')
+            initial=self.read_pose(end)['xyz']
+            if math.dist(initial,xyz)>self.correction_tolerance_mm:
+                self.move(xyz,end-3.)
+            self.feed = self.correction_feed if limit is None else min(self.correction_feed, limit)
+            result = recover_pose(self, xyz, ctx, tolerance_mm=self.correction_tolerance_mm, max_moves=3,
+                                  stop_budget_s=3., max_correction_step_mm=5. if loaded else 10.,
+                                  max_command_offset_mm=10. if loaded else 25.)
         self.active_deadline = None
-        self.records.append({'event': 'POSE_RESULT', 'stage': stage, 'loaded': loaded, 'result': result})
+        self.records.append({'event': 'POSE_RESULT', 'stage': stage, 'loaded': loaded,
+                             'travel_feed_mm_min': travel_feed, 'result': result})
         if result['outcome'] != 'measured_target_reached':
             raise RuntimeError(stage + ': ' + result.get('error', 'measured pose did not reach target'))
         return result

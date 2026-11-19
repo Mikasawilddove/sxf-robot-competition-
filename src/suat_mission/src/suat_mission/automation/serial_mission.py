@@ -138,6 +138,8 @@ class SerialMissionRuntime:
         self.session.fast_feed=float(self.config.get('arm_fast_feed_mm_min',80000.))
         self.session.contact_feed=float(self.config.get('arm_contact_feed_mm_min',40000.))
         self.session.correction_feed=float(self.config.get('arm_correction_feed_mm_min',1000.))
+        if self.config.get('mission_scope') == 'cake-only':
+            self.session.loaded_feed_limit = 10000.
         self.session.permitted=lambda: self._permitted()
         self.session.open()
         self.arm_pose=self.session.read_pose(time.monotonic()+3.)['xyz']
@@ -443,10 +445,23 @@ class SerialMissionRuntime:
                 self.observation('objects',context.deadline)
                 return self.unreachable_pick(context,exc)
         self.move('contact',contact,context.deadline)
+        lift_from = contact
+        if self.session.loaded_feed_limit is not None:
+            # Anchor the vertical command to the measured contact pose. The cup
+            # may have settled a few mm from the requested contact coordinates.
+            lift_from = self.arm_pose
+            if not math.isfinite(lift) or lift <= self.session.correction_tolerance_mm:
+                raise GeometryUnavailable('lift must exceed the arm arrival tolerance')
+            for fraction in (.25, .5, .75, 1.):
+                sample = [lift_from[0], lift_from[1], lift_from[2] + fraction * lift]
+                self.geometry.check_pose(sample)
+                if not self.session.validate_target(sample, context.deadline):
+                    raise GeometryUnavailable('vertical lift from measured contact is outside controller reach')
+        lift_target = [lift_from[0], lift_from[1], lift_from[2]+lift]
         self.session.pump(True,deadline=context.deadline)
         self.held=target.object_id  # possible holding until image evidence settles it
         self.held_label=label
-        self.move('lift',[contact[0],contact[1],contact[2]+lift],context.deadline,loaded=True)
+        self.move('lift',lift_target,context.deadline,loaded=True)
         if self.geometry.values.get('hold_observation_pose_mm'):
             self.move('hold_view',self.geometry.values['hold_observation_pose_mm'],context.deadline,loaded=True)
         try:
