@@ -16,6 +16,27 @@ CAMERA_TOPICS = {
 }
 
 
+def missing_base_command(nodes, topics):
+    """Restore only the missing base on an otherwise retained localization stack."""
+    if (not {'/amcl','/map_server'} <= set(nodes) or '/scan' not in topics
+            or '/odom' in topics or '/spark_base_server' in nodes):
+        return None
+    if '/cmd_vel' in topics:
+        raise RuntimeError('cannot start the missing base driver while /cmd_vel has a publisher')
+    device='/dev/sparkBase'
+    if not Path(device).exists():
+        raise RuntimeError('base driver missing and '+device+' is absent')
+    owner=subprocess.run(['fuser',device],capture_output=True)
+    if owner.returncode!=1 or owner.stdout.strip() or owner.stderr.strip():
+        raise RuntimeError('base driver missing; exclusive access to '+device+' is unavailable')
+    description={'/robot_state_publisher','/joint_state_publisher'}.intersection(nodes)
+    if not description:
+        return ['roslaunch','spark_bringup','driver_bringup.launch','start_base:=true',
+                'start_camera:=false','enable_arm_tel:=false','arm_type_tel:=uarm',
+                'camera_type_tel:=d435','lidar_type_tel:=ydlidar_g2']
+    return ['roslaunch','spark_base','spark_base.launch','serialport:='+device]
+
+
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('scope',choices=('cake-only','full'),nargs='?',default='cake-only')
@@ -41,7 +62,7 @@ def main():
     import yaml
     from suat_mission.automation.mission_console import discard_pending_input, main as run_console
     from suat_mission.navigation.navigation_profiles import (
-        CONTROLLER_HZ, GLOBAL_PLANNER_PLUGIN, LOCAL_PLANNER_PLUGIN, PLANNER_NAMESPACE,
+        CONTROLLER_HZ, configured_global_planner, LOCAL_PLANNER_PLUGIN, PLANNER_NAMESPACE,
         local_planner_settings, planner_profile_matches,
     )
     from suat_mission.official_calibration import bind_official_geometry
@@ -121,6 +142,10 @@ def main():
         nodes=rosnode.get_node_names()
         topics=dict(rospy.get_published_topics())
         localization=None
+        base_command=missing_base_command(nodes,topics)
+        if base_command:
+            print('Restoring the missing Spark base driver for the running localization stack.',flush=True)
+            localization=spawn('base_recovery',base_command)
         if '/map' not in topics and not {'/map_server','/amcl'}.intersection(nodes):
             if not args.at_start_a:
                 raise RuntimeError('automatic localization startup requires the robot at the saved A pose and --at-start-a')
@@ -143,7 +168,9 @@ def main():
         field_topics={'/map','/scan','/odom'}
         if not ready(lambda: field_topics <= dict(rospy.get_published_topics()).keys()
                      and '/amcl' in rosnode.get_node_names(),localization,30.):
-            raise RuntimeError('field localization requires /map, /scan, /odom and AMCL; logs: '+str(logs))
+            missing=sorted(field_topics-dict(rospy.get_published_topics()).keys())
+            raise RuntimeError('field localization unavailable; missing topics=%s, AMCL=%s; logs: %s'
+                               % (missing,'/amcl' in rosnode.get_node_names(),logs))
         if not ready(lambda: not missing_camera(),camera,20.):
             raise RuntimeError('RGB-D camera is missing '+', '.join(missing_camera())+'; logs: '+str(logs))
 
@@ -176,29 +203,40 @@ def main():
         print('Automatically aligning Start_A while stopped.',flush=True)
         alignment=restore_start_a(root,alignment_report)
         print('Start_A localization '+alignment['status']+': '+str(alignment_report),flush=True)
+    expected_global=configured_global_planner(root,args.planner)
     def desired_navigation(state):
         return (state and state.get('owner')=='/suat_mission' and state.get('speed_profile')==args.speed
                 and state.get('mission_keepout') is True
                 and {'lease_linear_cap_mps','lease_angular_cap_radps'}<=state.keys()
-                and rospy.get_param('/move_base/base_global_planner',None)==GLOBAL_PLANNER_PLUGIN
+                and rospy.get_param('/move_base/base_global_planner',None)==expected_global
                 and rospy.get_param('/move_base/base_local_planner',None)==LOCAL_PLANNER_PLUGIN
                 and rospy.get_param('/move_base/controller_frequency',None)==CONTROLLER_HZ
                 and planner_profile_matches(rospy.get_param(PLANNER_NAMESPACE,{}),args.planner))
 
+    nav=message('/suat/navigation/state',1.)
+    if nav and (nav.get('state')=='ARMED' or nav.get('active_goal')):
+        raise RuntimeError('another navigation leg is active')
     if nav and not desired_navigation(nav):
         rospy.ServiceProxy('/suat_navigation_gate/stop',Trigger)()
         rosnode.kill_nodes([n for n in rosnode.get_node_names() if n in
             ('/move_base','/suat_navigation_gate','/suat_navigation_nodelet_manager','/suat_navigation_smoother')])
         rospy.sleep(1.);nav=None
+    proc=None
     if nav is None:
         proc=spawn('navigation',[sys.executable,'tools/start_field_navigation.py','--start','--speed',args.speed,
                                  '--planner',args.planner,'--owner','mission'])
-        deadline=time.monotonic()+20.
-        while time.monotonic()<deadline:
-            if proc.poll() is not None:raise RuntimeError('navigation startup failed: '+str(logs/'navigation.log'))
-            nav=message('/suat/navigation/state',1.)
-            if desired_navigation(nav) and nav.get('health') is None:break
-        else:raise RuntimeError('navigation did not become ready; see '+str(logs))
+    deadline=time.monotonic()+20.
+    while time.monotonic()<deadline:
+        if proc is not None and proc.poll() is not None:
+            raise RuntimeError('navigation startup failed: '+str(logs/'navigation.log'))
+        nav=message('/suat/navigation/state',1.)
+        if nav and (nav.get('state')=='ARMED' or nav.get('active_goal')):
+            raise RuntimeError('another navigation leg is active')
+        if desired_navigation(nav) and nav.get('health') is None:break
+    else:
+        actual=rospy.get_param('/move_base/base_global_planner',None)
+        raise RuntimeError('navigation did not become ready; global planner expected=%s actual=%s; '
+                           'gate=%s; see %s' % (expected_global,actual,json.dumps(nav),logs))
     old_scene='/suat_mission_scene'
     if old_scene in rosnode.get_node_names():rosnode.kill_nodes([old_scene]);rospy.sleep(.3)
     process=spawn('mission',['roslaunch','suat_mission','mission.launch','navigation_speed:='+args.speed,

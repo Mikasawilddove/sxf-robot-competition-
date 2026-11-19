@@ -12,7 +12,7 @@ import xmlrpc.client
 ROOT=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT/'src/suat_mission/src'))
 from suat_mission.navigation.navigation_profiles import (
-    CONTROLLER_HZ, GLOBAL_PLANNER_PLUGIN, LOCAL_PLANNER_PLUGIN, PLANNER_MODES,
+    CONTROLLER_HZ, configured_global_planner, LOCAL_PLANNER_PLUGIN, PLANNER_MODES,
     local_planner_settings, speed_profile,
 )
 from suat_mission.navigation.navigation_map import load_binding
@@ -29,8 +29,9 @@ def main():
     args=parser.parse_args();speed=speed_profile(args.speed)
     owner='/suat_mission' if args.owner=='mission' else '/suat_field_navigation'
     settings=local_planner_settings(args.planner)
+    global_planner=configured_global_planner(ROOT,args.planner)
     result={'mode':'field','speed':args.speed,'planner':args.planner,'limits':speed,'field_validated':False,'navigation_owner':owner,
-            'global_planner':GLOBAL_PLANNER_PLUGIN,'local_planner':LOCAL_PLANNER_PLUGIN,
+            'global_planner':global_planner,'local_planner':LOCAL_PLANNER_PLUGIN,
             'controller_hz':CONTROLLER_HZ,'cruise_sampling':settings,
             'approach_sampling':local_planner_settings(args.planner,approach=True),
             'output_initially':'DISARMED_NO_CMD_VEL_PUBLISHER','motion_goal_sent':False}
@@ -44,7 +45,7 @@ def main():
     conflicts=sorted(n for n in nodes if any(x in n.lower() for x in ('gmapping','cartographer','teleop'))
                      or (n=='/suat_mission' and args.owner!='mission')
                      or n in ('/move_base','/suat_navigation_gate','/suat_navigation_nodelet_manager','/suat_field_navigation'))
-    missing=[name for name in ('move_base','dwa_local_planner','navfn','follower_velocity_smoother','suat_mission')
+    missing=[name for name in ('move_base','dwa_local_planner',global_planner.split('/',1)[0],'follower_velocity_smoother','suat_mission')
              if subprocess.run(['rospack','find',name],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL).returncode]
     ready=not conflicts and not missing and not dict(pubs).get('/cmd_vel') and dict(pubs).get('/map')==['/map_server'] and '/amcl' in nodes
     result.update(ready_to_start=ready,conflicts=conflicts,missing_packages=missing)

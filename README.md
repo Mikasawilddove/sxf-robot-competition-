@@ -23,7 +23,7 @@ bash tools/run_match.sh cake-only --at-start-a --speed fast --planner rollout
 
 将机器人预先摆在已标定的 A 区起点，朝 D。脚本提示后按一次 Enter。脚本自行启动或复用 ROS、定位、RGB-D 相机和导航，在有桌面显示时打开相机预览和 RViz，定位与任务准备通过后自动开始。蛋糕流程依次执行导航、停车读板、取物、运送和放置，并保留结果。启动准备计入本次时间预算。
 
-正式入口的两种局部规划模式共用 Navfn、代价地图、碰撞范围和速度档。默认使用 Trajectory Rollout，DWA 可用下面的命令启动同一任务。
+正式入口的两种局部规划模式共用全局规划器、代价地图、碰撞范围和速度档。现场配置使用 `global_planner/GlobalPlanner`。启动器与任务执行器都按导航配置核对实际加载的插件。默认使用 Trajectory Rollout，DWA 可用下面的命令启动同一任务。
 
 ```bash
 bash tools/run_match.sh cake-only --at-start-a --speed fast --planner dwa

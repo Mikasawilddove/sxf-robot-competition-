@@ -1,5 +1,6 @@
 """One source for planner, smoother and output limits. Candidates, not hardware ratings."""
 import math
+from pathlib import Path
 
 PROFILES = {
     'slow': {'linear': .08, 'angular': .30, 'accel_linear': .20, 'accel_angular': .60},
@@ -11,7 +12,22 @@ PLANNER_MODES = ('rollout', 'dwa')
 CONTROLLER_HZ = 10.0
 PLANNER_NAMESPACE = '/move_base/DWAPlannerROS'
 LOCAL_PLANNER_PLUGIN = 'dwa_local_planner/DWAPlannerROS'
-GLOBAL_PLANNER_PLUGIN = 'navfn/NavfnROS'
+
+
+def configured_global_planner(root, mode):
+    """Read move_base's global plugin in navigation_field.launch load order."""
+    import yaml
+    directory = Path(root) / 'src/suat_mission/config'
+    names = ['navigation_test.yaml']
+    if mode == 'rollout':
+        names.append('navigation_rollout_candidate.yaml')
+    plugin = None
+    for name in names:
+        with (directory / name).open(encoding='utf-8') as stream:
+            plugin = yaml.safe_load(stream).get('base_global_planner', plugin)
+    if not isinstance(plugin, str) or '/' not in plugin:
+        raise ValueError('invalid base_global_planner in ' + ', '.join(names))
+    return plugin
 
 # Both modes use the same critics and footprint. Sampling differs because
 # the dynamic window covers one control period, while rollout covers a horizon.

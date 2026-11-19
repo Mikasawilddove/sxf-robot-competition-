@@ -7,7 +7,7 @@ make_plan_clear_costmap: false
 make_plan_add_unreachable_goal: false
 oscillation_timeout: 8.0
 oscillation_distance: 0.10
-base_global_planner: navfn/NavfnROS
+base_global_planner: global_planner/GlobalPlanner
 base_local_planner: dwa_local_planner/DWAPlannerROS
 # No automatic spinning or obstacle-clearing recovery in the first test.
 recovery_behavior_enabled: false
@@ -45,6 +45,10 @@ DWAPlannerROS:
 NavfnROS:
   allow_unknown: false
   default_tolerance: 0.0
+GlobalPlanner:
+  allow_unknown: false
+  use_dijkstra: true
+  use_grid_path: true
 global_costmap:
   global_frame: map
   robot_base_frame: base_footprint

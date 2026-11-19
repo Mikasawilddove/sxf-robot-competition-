@@ -21,7 +21,7 @@ import tf2_ros
 from suat_mission.navigation.navigation_map import load_binding,verify_map
 from suat_mission.navigation.navigation_gate import goal_is_free
 from suat_mission.navigation.navigation_profiles import (
-    CONTROLLER_HZ, GLOBAL_PLANNER_PLUGIN, LOCAL_PLANNER_PLUGIN, PLANNER_NAMESPACE,
+    CONTROLLER_HZ, configured_global_planner, LOCAL_PLANNER_PLUGIN, PLANNER_NAMESPACE,
     speed_profile,leg_timeout,path_travel_fault,planner_speed_limits,station_approach_pose,
     local_planner_settings, planner_profile_matches, settings_match,
 )
@@ -49,6 +49,7 @@ class Navigator:
         self.owner=owner or rospy.get_name()
         self.health_check=health_check
         self.planner_mode=planner_mode
+        self.global_planner=configured_global_planner(root, planner_mode) if planner_mode is not None else None
         self.binding=load_binding(root);self.speed=speed
         self.keepout=PickupKeepout.load(root,self.binding) if self.owner=='/suat_mission' else None
         footprint=rospy.get_param('/move_base/global_costmap/footprint','[]')
@@ -221,8 +222,10 @@ class Navigator:
         limits=planner_speed_limits(self.speed)
         live=rospy.get_param(PLANNER_NAMESPACE,{})
         if self.planner_mode is not None:
-            if (rospy.get_param('/move_base/base_global_planner',None)!=GLOBAL_PLANNER_PLUGIN
-                    or rospy.get_param('/move_base/base_local_planner',None)!=LOCAL_PLANNER_PLUGIN
+            actual_global=rospy.get_param('/move_base/base_global_planner',None)
+            if actual_global!=self.global_planner:
+                raise ValueError('global planner mismatch: expected %s, got %s' % (self.global_planner,actual_global))
+            if (rospy.get_param('/move_base/base_local_planner',None)!=LOCAL_PLANNER_PLUGIN
                     or rospy.get_param('/move_base/controller_frequency',None)!=CONTROLLER_HZ
                     or not planner_profile_matches(live,self.planner_mode)):
                 raise ValueError('active ROS navigation does not match the selected local planner profile')
