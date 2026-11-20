@@ -141,8 +141,12 @@ class SerialMissionRuntime:
                                        'top_z_mm':self.geometry.point(target)[2]}
         self.active_pub.publish(String(data=json.dumps(payload)))
 
-    def open(self):
+    def open(self, *, preparing=False, check_preparing=None, write_if_running=None):
         if self.session is not None:
+            if not preparing and not self.session.initialized:
+                self.session.enable_motion()
+                self.arm_pose=self.session.read_pose(time.monotonic()+3.)['xyz']
+                self.event('serial_initialized', measured_pose_mm=self.arm_pose)
             return
         from suat_mission.manipulation.arm_session import ArmSession
         self.session=ArmSession(self.run,feed=float(self.config.get('arm_feed_mm_min',1000.)))
@@ -151,7 +155,10 @@ class SerialMissionRuntime:
         self.session.correction_feed=float(self.config.get('arm_correction_feed_mm_min',1000.))
         self.session.loaded_feed_limit = FEED_LOADED
         self.session.permitted=lambda: self._permitted()
-        self.session.open()
+        self.session.write_if_running=write_if_running
+        self.session.open(preparing=preparing,check_preparing=check_preparing)
+        if check_preparing is not None:
+            check_preparing()
         self.arm_pose=self.session.read_pose(time.monotonic()+3.)['xyz']
         self.event('serial_open', measured_pose_mm=self.arm_pose)
 
