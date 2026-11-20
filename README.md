@@ -3,6 +3,8 @@
 本轮实机进度、失败记录与待验收项见[开发进度与实机缺口](docs/integration-log.md)。
 四侧导航分支的实录候选格式、离线覆盖矩阵与对照步骤见[四侧导航开发与验收](docs/navigation-four-side.md)。
 
+Cake-only 正式集成版本的构建、部署和 C0–C11 验收见 [Cake-only 集成与部署](docs/cake-only-integration.md)。
+
 本仓库维护 ROS 1 Noetic 下的导航、视觉、机械臂与任务编排核心代码。各模块可独立开发，比赛入口负责接起完整流程。
 
 机器人从 `/home/spark/SUAT/spark` 开发和运行。六模块的快捷命令见[模块开发入口](docs/模块开发入口.md)，机器人桌面可打开 `/home/spark/SUAT/cmd.txt`。
@@ -42,13 +44,13 @@ bash tools/run_match.sh cake-only --at-start-a --speed slow --planner dwa
 
 ## 整场模式与证据
 
-`cake-only` 完成本局读板和蛋糕送 A 后结束。`full` 继续按分类板结果运送普通块。它使用独立的 39 cm 候选配置。
+`cake-only` 从原路线的 `Sorting_W` 取蛋糕并送 A，使用默认 DLT。`full` 继续按分类板结果运送普通块，可显式选择独立的 39 cm 候选配置。
 
 ```bash
 bash tools/run_match.sh full --at-start-a --speed slow --planner rollout --mission-config src/suat_mission/config/mission_full_pickup_39_candidate_20261119.yaml
 ```
 
-分类板投票通过后，系统按西、南、东、北的候选顺序找同一物块。确认空手后可有限重试或换侧。抓取需要新的顶面观测，运输需要持物证据，放置需要同一物块脱离吸盘并稳定在正确区域。只有已确认放置的物块才计数。结果保存在 `reports/runs/<run_id>/result.json`。
+显式选择上述 `full` 配置时，分类板投票通过后，系统按西、南、东、北的候选顺序找同一物块。确认空手后可有限重试或换侧。抓取需要新的顶面观测，运输需要持物证据，放置需要同一物块脱离吸盘并稳定在正确区域。只有已确认放置的物块才计数。结果保存在 `reports/runs/<run_id>/result.json`。
 
 ## 本地现场资源
 

@@ -141,7 +141,7 @@ class FieldGraspGeometry:
         if carrying and tool.get('state')=='observed':
             cup=np.asarray(tool['cup_point_arm_mm']);n=np.asarray(surface['plane_normal_arm'])
             point=cup-n*(n@cup-surface['plane_offset_arm_mm'])
-            polygon=np.asarray(surface['support_polygon_arm_mm'],np.float32)[:,:2]
+            polygon=np.ascontiguousarray(np.asarray(surface['support_polygon_arm_mm'])[:,:2],dtype=np.float32)
             if cv2.pointPolygonTest(polygon.reshape(-1,1,2),tuple(point[:2].astype(float)),False)>=0:
                 surface['attachment_point_arm_mm']=point.tolist()
         return surface

@@ -1,8 +1,6 @@
 # 正式串联执行器：现场数据由pickup_geometry_file读取，不改写旧后端的verified开关。
 execution_backend: serial_rgbd
 pickup_geometry_file: data/calibration/field_20261117/pickup_geometry_visual_20261119.yaml
-# 单蛋糕入口复用西侧验证的同一 DLT 和备用吸附点工作区。
-cake_pickup_geometry_file: data/calibration/field_20261117/pickup_geometry_39_candidate_20261119.yaml
 recorded_route_file: data/navigation/recorded_stations_20261115.json
 additional_waypoints_file: data/waypoints/collection_bcd_candidates_20261117.json
 board_geometry_file: data/calibration/board_view_candidates/classification_arrival_20261115_03_v1.json
@@ -43,9 +41,8 @@ target_frames: 5
 target_min_frames: 3
 target_max_distance_px: 35.0
 target_roi: []
-# 分支二录点派生的四侧接近站，真机自动到站和抓取仍待验收。
-pickup_stations_file: data/waypoints/pickup_approaches_20261119.json
-sorting_points: [Sorting_W, Sorting_S, Sorting_E, Sorting_N]
+# 单蛋糕走已录路线的西侧站。四侧接近站只在显式选择的 full 配置中使用。
+sorting_points: [Sorting_W]
 each_count: 3
 mission_timeout: 600.0
 judge_clock_already_running: false # explicitly choose whether the judge clock is running at preparation

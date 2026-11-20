@@ -1,0 +1,53 @@
+{
+  "branch": "codex1/integrated-mission-navigation",
+  "revision": "The commit containing this manifest",
+  "merge_base": "bea74527ed8ba0bb5c045f99c5de63e86dec423e",
+  "navigation_parent": "e251c731c37181b44c5d9a28ddc569fbbc825808",
+  "startup_parent": "b45235894982d808daba3acd1940ff6036ce57a7",
+  "entry": "bash tools/run_match.sh cake-only --at-start-a --speed slow --planner rollout",
+  "baseline_required_for_overlay": "e251c731c37181b44c5d9a28ddc569fbbc825808",
+  "runtime_overlay_from_navigation_parent": [
+    "src/suat_mission/config/mission.yaml",
+    "src/suat_mission/package.xml",
+    "src/suat_mission/src/suat_mission/automation/mission.py",
+    "src/suat_mission/src/suat_mission/automation/mission_node.py",
+    "src/suat_mission/src/suat_mission/automation/run_gate.py",
+    "src/suat_mission/src/suat_mission/automation/serial_mission.py",
+    "src/suat_mission/src/suat_mission/manipulation/arm_session.py",
+    "src/suat_mission/src/suat_mission/manipulation/field_grasp_geometry.py",
+    "tools/check_readiness.py",
+    "tools/run_competition.py",
+    "tools/run_match.sh"
+  ],
+  "tracked_delivery": ["src/suat_mission", "tools"],
+  "preserve_on_host": [
+    "src/suat_mission/config/selected_map.yaml",
+    "data/",
+    "reports/",
+    "src/suat_mission/assets/templates/",
+    "src/suat_mission/zone/zone_markers/",
+    "locally modified or untracked source"
+  ],
+  "field_inputs_from_local_snapshot": [
+    "src/suat_mission/config/selected_map.yaml",
+    "data/maps/corner_20261115_A_03/map.yaml",
+    "data/maps/corner_20261115_A_03/map.pgm",
+    "data/calibration/field_to_map_corner_20261115_A_03.json",
+    "data/waypoints/start_pose_A.yaml",
+    "data/navigation/recorded_stations_20261115.json",
+    "data/navigation/central_pickup_keepout.json",
+    "data/waypoints/corner_20261115_A_03_candidates.json",
+    "data/calibration/board_view_candidates/classification_arrival_20261115_03_v1.json",
+    "data/calibration/field_20261117/board_view_classification_arrival_20261117_v1.json",
+    "data/calibration/field_20261117/pickup_geometry_visual_20261119.yaml",
+    "src/suat_mission/assets/templates/cake.png",
+    "src/suat_mission/assets/templates/clock.png",
+    "src/suat_mission/assets/templates/teddybear.png",
+    "src/suat_mission/assets/templates/banana.png",
+    "src/suat_mission/zone/zone_markers/B.png",
+    "src/suat_mission/zone/zone_markers/C.png",
+    "src/suat_mission/zone/zone_markers/D.png"
+  ],
+  "optional_in_current_config": ["data/waypoints/collection_bcd_candidates_20261117.json"],
+  "physical_validation": "NOT TESTED"
+}

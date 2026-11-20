@@ -170,10 +170,11 @@ class Mission:
             index = stations.index(self.retry_after_station) + 1
             stations = stations[index:] + stations[:index]
         self.retry_after_station = None
+        navigation_deadline = NavigationBudget(self.config.navigation_timeout).deadline(self.clock(), self.end_time)
         for waypoint in stations:
             self.report.phase = 'navigate_to_pickup'
             try:
-                self._nav(waypoint)
+                self._nav(waypoint, navigation_deadline=navigation_deadline)
             except ActionFailure as exc:
                 if exc.result.outcome != Outcome.UNREACHABLE:
                     raise

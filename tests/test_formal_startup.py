@@ -52,7 +52,10 @@ class Port:
         self.closed = True
 
 
-class FormalStartup(unittest.TestCase):
+class StartupFixture(unittest.TestCase):
+    port_type = Port
+    isolated_startup = True
+
     def setUp(self):
         self.stack = ExitStack()
         self.addCleanup(self.stack.close)
@@ -90,10 +93,12 @@ class FormalStartup(unittest.TestCase):
 
         def tick():
             nonlocal now
-            now += .05
+            now += .02
             return now
 
         clock = SimpleNamespace(monotonic=tick, sleep=lambda _: None)
+        self.clock = clock
+        self.ros = ros
         for target in (self.arm, self.runtime, self.adapter):
             self.stack.enter_context(patch.object(target, 'time', clock))
         self.stack.enter_context(patch.object(self.arm.tempfile, 'gettempdir', return_value=str(self.folder)))
@@ -108,21 +113,11 @@ class FormalStartup(unittest.TestCase):
             getSystemState=lambda _: (1, '', [[], [], []]), lookupNode=lambda *_: (0, '', ''))))
 
         def make_port(path):
-            port = Port(path, self.commands)
+            port = self.port_type(path, self.commands)
             self.ports.append(port)
             return port
 
         self.stack.enter_context(patch.object(self.arm, 'SerialPort', side_effect=make_port))
-        for target, value in (
-            ('resolve_serial_config', lambda config, _: config),
-        ):
-            self.stack.enter_context(patch.object(self.runtime, target, value))
-        for target, value in (
-            ('load_binding', lambda _: {}),
-            ('inspect_config', lambda *a, **k: {'configuration_complete': True}),
-        ):
-            self.stack.enter_context(patch.object(self.adapter, target, value))
-
         def configure(robot):
             runtime = self.runtime.SerialMissionRuntime.__new__(self.runtime.SerialMissionRuntime)
             runtime.config, runtime.run = robot.config, self.folder
@@ -134,9 +129,14 @@ class FormalStartup(unittest.TestCase):
             robot.serial_runtime = runtime
             robot.observation_timeout = .1
 
-        self.stack.enter_context(patch.object(self.adapter.SerialRosRobot, '_load_config', configure))
-        self.stack.enter_context(patch.object(self.adapter.SerialRosRobot, '_serial_scene', return_value=object()))
-        self.stack.enter_context(patch.object(self.adapter.SerialRosRobot, 'prepare_navigation', return_value=None))
+        if self.isolated_startup:
+            self.stack.enter_context(patch.object(self.adapter, 'load_binding', return_value={}))
+            self.stack.enter_context(patch.object(self.adapter, 'inspect_config',
+                return_value={'configuration_complete': True}))
+            self.stack.enter_context(patch.object(self.runtime, 'resolve_serial_config', lambda config, _: config))
+            self.stack.enter_context(patch.object(self.adapter.SerialRosRobot, '_load_config', configure))
+            self.stack.enter_context(patch.object(self.adapter.SerialRosRobot, '_serial_scene', return_value=object()))
+            self.stack.enter_context(patch.object(self.adapter.SerialRosRobot, 'prepare_navigation', return_value=None))
         self.node = self.adapter.Node()
         self.recorder = Mock(path=self.folder, finished=False)
         self.node._make_recorder = lambda: setattr(self.node, 'recorder', self.recorder)
@@ -154,6 +154,8 @@ class FormalStartup(unittest.TestCase):
         self.assertTrue(self.node.prepared, self.node.error)
         return self.node.robot.serial_runtime.session
 
+
+class FormalStartup(StartupFixture):
     def test_prepare_reaches_ready_through_serial_handshake(self):
         session = self.prepare()
         self.assertIn('P2200', self.commands)

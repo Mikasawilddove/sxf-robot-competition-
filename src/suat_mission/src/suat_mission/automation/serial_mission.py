@@ -684,6 +684,12 @@ class SerialMissionRuntime:
                 landing_kind='transport'
                 self.event('transport_fallback_plan',zone=zone,release_mm=release,recorded_region=region)
             else:
+                polygon=placement.get('polygon_arm_mm')
+                if (not isinstance(polygon, (list, tuple)) or len(polygon)<3
+                        or any(not isinstance(p, (list, tuple)) or len(p)!=2
+                               or not all(type(v) in (int, float) and math.isfinite(v) for v in p)
+                               for p in polygon)):
+                    return ActionResult(context,Outcome.UNKNOWN,'no valid observed destination polygon')
                 support=float(placement['support_z_mm'])
                 height=float(self.geometry.values.get('object_height_mm',{}).get(label,100.))
                 z=support+height+float(self.geometry.values.get('release_bottom_clearance_mm',100.))+self.geometry.cup_offset
@@ -696,14 +702,19 @@ class SerialMissionRuntime:
                     try:release,region,support=self.geometry.transport_release(zone,label,slot)
                     except GeometryUnavailable as exc:return ActionResult(context,Outcome.UNKNOWN,str(exc))
                     landing_kind='transport'
+                    polygon=None
                     self.event('transport_fallback_plan',zone=zone,release_mm=release,recorded_region=region)
                 else:
-                    polygon=placement['polygon_arm_mm']
                     region=[min(p[0] for p in polygon),max(p[0] for p in polygon),min(p[1] for p in polygon),max(p[1] for p in polygon)]
                     self.event('visual_release_plan',zone=zone,release_mm=release,observed_region=placement)
         else:
             release=self.geometry.release(zone,label,slot)
             support=float(self.geometry.values.get('drop_support_z_mm',{}).get(zone,self.geometry.support_z))
+        region=region or self.geometry.values.get('drop_regions_arm_mm',{}).get(zone)
+        if (not isinstance(region, (list, tuple)) or len(region)!=4
+                or not all(type(v) in (int, float) and math.isfinite(v) for v in region)
+                or region[0]>=region[1] or region[2]>=region[3] or not math.isfinite(support)):
+            return ActionResult(context,Outcome.UNKNOWN,'no measured placement region for '+zone)
         above=[release[0],release[1],max(release[2]+40.,self.arm_pose[2])]
         self.active('place')
         self.move('place_approach',above,context.deadline,loaded=True)
@@ -712,9 +723,6 @@ class SerialMissionRuntime:
         self.move('withdraw',above,context.deadline)
         self.active('verify_placement')
         height=float(self.geometry.values.get('object_height_mm',{}).get(label,100.))
-        region=region or self.geometry.values.get('drop_regions_arm_mm',{}).get(zone)
-        if not region or len(region)!=4:
-            return ActionResult(context,Outcome.UNKNOWN,'released, but no measured placement region for '+zone)
         tolerance=float(self.geometry.values.get('height_tolerance_mm',12.))
         landing_margin=math.sqrt(2)*float(self.geometry.values.get('object_width_mm',{}).get(label,100.))/2.
         def inside(p):
@@ -730,7 +738,7 @@ class SerialMissionRuntime:
                 float(self.config.get('feedback_timeout',15.))),lambda d,p:
                 inside(p)
                 and abs(p[2]-(support+height))<=tolerance
-                and math.dist(p,[self.arm_pose[0],self.arm_pose[1],self.arm_pose[2]-self.geometry.cup_offset])>self.geometry.cup_radius,
+                and self.observed_empty_for(self.last_scene,context.object_id),
                 point_of=lambda d:self.geometry.point(d,require_fit=False),stable_mm=tolerance)
         except TimeoutError:
             return ActionResult(context,Outcome.UNKNOWN,'release commanded; correct final region not observed')

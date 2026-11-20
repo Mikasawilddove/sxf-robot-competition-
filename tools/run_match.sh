@@ -7,4 +7,5 @@ set --
 source /opt/ros/noetic/setup.bash
 source /home/spark/spark_noetic/devel/setup.bash
 source devel/setup.bash
-exec python3 tools/run_competition.py "${match_args[@]}"
+exec flock --nonblock --no-fork --conflict-exit-code 75 \
+    "/tmp/suat-spark-${UID}-competition.lock" python3 tools/run_competition.py "${match_args[@]}"

@@ -619,7 +619,7 @@ class SerialRosRobot(RosRobot):
                     RosRobot._ensure_running(self,check_attachment=False)
                 if self.latest_scene is not None and self.latest_scene.version>after:
                     age=time.monotonic()-self.latest_scene.observed_at
-                    if age<=float(self._param('observation_max_age',2.)):
+                    if 0<=age<=float(self._param('observation_max_age',2.)):
                         return self.latest_scene
                 self.cv.wait(min(.1,max(0.,deadline-time.monotonic())))
         raise TimeoutError('no fresh physical-instance observation from the camera adapter')
@@ -735,8 +735,18 @@ class SerialRosRobot(RosRobot):
         self.holding=self.serial_runtime.held is not None
         return result
 
+    def navigate(self, name, remaining, context):
+        self.last_confirmed_station = None
+        result = super().navigate(name, remaining, context)
+        if result.outcome == Outcome.CONFIRMED:
+            self.last_confirmed_station = (name, result.context.run_id, result.context.object_id)
+        return result
+
     def _drop(self, zone, label, context):
         self._require_stopped_base()
+        arrived = getattr(self, 'last_confirmed_station', None)
+        if arrived != ('Collection_' + zone, context.run_id, context.object_id):
+            return ActionResult(context, Outcome.UNKNOWN, 'current payload has no confirmed destination arrival')
         result=self.serial_runtime.drop(zone,label,context)
         self.holding=self.serial_runtime.held is not None
         return result
@@ -774,7 +784,8 @@ class SerialRosRobot(RosRobot):
 
     def close(self):
         status=self.serial_runtime.close()
-        self.recovery_required=bool(status.get('pump_may_be_on') or status.get('ownership_retained'))
+        self.recovery_required=bool(self.serial_runtime.held is not None
+                                    or status.get('pump_may_be_on') or status.get('ownership_retained'))
         if not self.recovery_required:
             RosRobot.close(self)
         return status
@@ -1219,8 +1230,9 @@ class Node:
                 return TriggerResponse(False,'no retained serial session needs release')
             try:
                 runtime=getattr(robot,'serial_runtime',None)
-                if runtime is not None and runtime.session is not None and runtime.session.pump_may_be_on:
-                    runtime.session.pump(False,deadline=time.monotonic()+8.,recovery=True)
+                if runtime is not None:
+                    if runtime.session is not None and runtime.session.pump_may_be_on:
+                        runtime.session.pump(False,deadline=time.monotonic()+8.,recovery=True)
                     runtime.held=None
                 self._close_robot(robot)
                 if self.robot is not None:

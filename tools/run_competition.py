@@ -290,8 +290,6 @@ def main():
         parser.error('mission configuration missing: '+str(mission_config))
     configuration=yaml.safe_load(mission_config.read_text(encoding='utf-8'))
     configured_geometry=configuration.get('pickup_geometry_file')
-    if args.scope=='cake-only' and not args.to_board:
-        configured_geometry=configuration.get('cake_pickup_geometry_file') or configured_geometry
     geometry=args.geometry or Path(configured_geometry or
         'data/calibration/field_20261117/pickup_geometry_visual_20261119.yaml')
     geometry=geometry.expanduser()
@@ -361,12 +359,15 @@ def main():
         try:return json.loads(rospy.wait_for_message(topic,String,timeout=timeout).data)
         except rospy.ROSException:return None
     state=message('/suat/mission/state',.5)
-    if state and (state.get('worker_id') or state.get('preparing') or state.get('recovery_required')):
-        raise RuntimeError('existing mission is active or retaining a possible payload; no second worker started')
+    mission_exists='/suat_mission' in rosnode.get_node_names()
+    if not args.to_board and mission_exists and state is None:
+        raise RuntimeError('existing mission state is unavailable; refusing to replace it')
+    if state and any(state.get(key) for key in ('worker_id','preparing','prepared','recovery_required')):
+        raise RuntimeError('existing mission is prepared, active or requires recovery; no second worker started')
     nav=message('/suat/navigation/state',1.)
     if nav and (nav.get('state')=='ARMED' or nav.get('active_goal')):
         raise RuntimeError('another navigation leg is active')
-    if not args.to_board and '/suat_mission' in rosnode.get_node_names():
+    if not args.to_board and mission_exists:
         rosnode.kill_nodes(['/suat_mission'])
         time.sleep(.5)
     if not args.calibration_preview:
@@ -470,7 +471,8 @@ def main():
                                  entered_at=entered_at)
     old_scene='/suat_mission_scene'
     if old_scene in rosnode.get_node_names():rosnode.kill_nodes([old_scene]);rospy.sleep(.3)
-    mission_command=['roslaunch','suat_mission','mission.launch','navigation_speed:='+args.speed,
+    mission_command=['roslaunch','suat_mission','mission.launch','workspace_root:='+str(root),
+                     'navigation_speed:='+args.speed,
                      'navigation_planner_mode:='+args.planner,'geometry_file:='+str(geometry),
                      'config:='+str(mission_config),
                      'observation_target:='+('cake' if args.scope=='cake-only' else 'clock')]
