@@ -4,11 +4,17 @@ import math
 from suat_mission.navigation.corner_egress import contact_handoffs
 from suat_mission.navigation.field_routes import StaticPlanner
 from suat_mission.navigation.navigation_gate import goal_is_free
-from suat_mission.navigation.stations import COLLECTION, SORTING, STATIONS, destination_radius
+from suat_mission.navigation.stations import BOARD_STATION, STATIONS, board_pairs, destination_radius, route_groups
+
+
+# Offline review floor only. Uses the existing 1 cm precise pickup goal
+# clearance as a screen along the whole route. Field margin is measured later.
+FIELD_REVIEW_FLOOR_M = .01
 
 
 def inspect_station(name, pose, grid, radius, keepout):
-    target_radius = radius if name == 'Start_A' else destination_radius(name,radius,keepout)
+    semantic_name = BOARD_STATION if name.startswith(BOARD_STATION+'__') else name
+    target_radius = radius if semantic_name == 'Start_A' else destination_radius(semantic_name,radius,keepout)
     return {'required_radius_m': target_radius,
             'footprint_clear': goal_is_free(grid,*pose[:2],target_radius),
             'keepout_clear': keepout.distance(pose)>target_radius}
@@ -81,19 +87,37 @@ def static_leg(start_name, goal_name, start, goal, grid, planner, keepout):
     return row
 
 
-def coverage(grid, stations, radius, keepout):
+def coverage(grid, stations, radius, keepout, *, board_candidates=()):
     planner=StaticPlanner(keepout.mask(grid), radius, keepout)
     endpoints = {name: (dict(stations[name], **inspect_station(name,stations[name]['pose'],grid,radius,keepout))
                         if name in stations else {'validation_status':'MISSING_RECORD'})
                  for name in STATIONS}
-    pairs = [('Start_A',name) for name in SORTING]
-    pairs += [(start,goal) for start in SORTING for goal in COLLECTION]
-    rows = []
-    for start,goal in pairs:
-        if start not in stations or goal not in stations:
-            rows.append({'start':start,'goal':goal,'static_plan':False,'footprint':'UNKNOWN',
-                         'keepout':'NOT_EVALUATED','status':'MISSING_RECORD'})
-            continue
-        rows.append(static_leg(start,goal,stations[start]['pose'],stations[goal]['pose'],grid,planner,keepout))
+
+    def check(pairs, points):
+        rows = []
+        for start,goal in pairs:
+            missing = [name for name in (start,goal) if name not in points]
+            if missing:
+                rows.append({'start':start,'goal':goal,'static_plan':False,'footprint':'UNKNOWN',
+                             'keepout':'NOT_EVALUATED','status':'MISSING_RECORD','missing_stations':missing})
+            else:
+                row = static_leg(start,goal,points[start]['pose'],points[goal]['pose'],grid,planner,keepout)
+                row['static_status'] = row['status']
+                if row['static_plan'] and row['min_clearance_lower_bound_m'] < FIELD_REVIEW_FLOOR_M:
+                    row.update(status='FIELD_REVIEW_REQUIRED',
+                               review_reason='clearance lower bound below offline review floor')
+                rows.append(row)
+        return rows
+
+    groups = {group:check(pairs,stations) for group,pairs in route_groups().items()}
+    alternatives = []
+    for candidate in board_candidates:
+        name = BOARD_STATION+'__'+candidate['id']
+        points = dict(stations)
+        points[name] = candidate
+        alternatives.append(dict(candidate, name=name,
+            **inspect_station(name,candidate['pose'],grid,radius,keepout),
+            routes=check(board_pairs(name),points)))
     return {'validation_type':'STATIC_MAP_ONLY','physical_navigation':'NOT_RUN',
-            'body_radius_m':radius,'stations':endpoints,'routes':rows}
+            'body_radius_m':radius,'field_review_floor_m':FIELD_REVIEW_FLOOR_M,
+            'stations':endpoints,'board_station_candidates':alternatives,**groups}

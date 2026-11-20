@@ -86,12 +86,16 @@ class NavigationIntegrationTests(unittest.TestCase):
         self.assertGreater(len(path),2)
         self.assertTrue(all(keepout.segment_clear(a,b,.22) for a,b in zip(path,path[1:])))
         report=coverage(grid,{'Sorting_W':{'pose':start},'Collection_C':{'pose':end}},.22,keepout)
-        self.assertEqual(len(report['routes']),20)
+        self.assertEqual(len(report['routes']),37)
+        self.assertEqual(len(report['fallback_routes']),12)
+        self.assertEqual(len(report['direct_start_routes']),4)
         self.assertEqual(report['physical_navigation'],'NOT_RUN')
         row=next(x for x in report['routes'] if (x['start'],x['goal'])==('Sorting_W','Collection_C'))
         self.assertEqual(row['status'],'STATIC_PASS')
         self.assertEqual((row['start_yaw_rad'],row['goal_yaw_rad']),(.2,-.3))
-        self.assertEqual(sum(x['status']=='MISSING_RECORD' for x in report['routes']),19)
+        self.assertEqual(sum(x['status']=='MISSING_RECORD' for x in report['routes']),35)
+        reverse = next(x for x in report['routes'] if (x['start'],x['goal'])==('Collection_C','Sorting_W'))
+        self.assertEqual(reverse['status'],'STATIC_PASS')
 
 
 if __name__=='__main__':

@@ -14,7 +14,21 @@ from suat_mission.navigation.start_pose import read_start_pose, validate_start_p
 
 SORTING = ('Sorting_W', 'Sorting_S', 'Sorting_E', 'Sorting_N')
 COLLECTION = ('Collection_A', 'Collection_B', 'Collection_C', 'Collection_D')
-STATIONS = ('Start_A', 'Classification_area', *SORTING, *COLLECTION)
+BOARD_STATION = 'Classification_area'
+STATIONS = ('Start_A', BOARD_STATION, *SORTING, *COLLECTION)
+
+
+def board_pairs(station=BOARD_STATION):
+    return [('Start_A',station), *((station,goal) for goal in SORTING)]
+
+
+def route_groups():
+    return {
+        'routes': board_pairs() + [(start,goal) for start in SORTING for goal in COLLECTION]
+                  + [(start,goal) for start in COLLECTION for goal in SORTING],
+        'fallback_routes': [(start,goal) for start in SORTING for goal in SORTING if start != goal],
+        'direct_start_routes': [('Start_A',goal) for goal in SORTING],
+    }
 
 
 def read_json(path):
@@ -85,7 +99,7 @@ def load_candidate(path, name, grid, image_digest):
     return dict(record, pose=station_pose(record['pose']), file=str(path))
 
 
-def mission_stations(root, config, binding):
+def mission_stations(root, config, binding, *, inventory=False):
     """Interpret the existing formats in the same order as formal navigation."""
     root = Path(root)
     points = {}
@@ -101,13 +115,20 @@ def mission_stations(root, config, binding):
 
     def read_resource(path, source, *, override=False, optional=False):
         path = root / path
-        if optional and not path.exists():
+        if (optional or inventory) and not path.exists():
             return
         data = read_json(path)
+        if data.get('schema') == 2 and 'child_frame_id' in data:
+            raise ValueError('individual TF candidate is not a formal station resource: '+str(path))
         validate_map_identity(data, binding)
         poses = data.get('waypoints', {})
-        if override and (data.get('frame_id') != 'map' or not isinstance(poses,dict) or set(poses) != set(SORTING)):
-            raise ValueError('four map-frame pickup approaches required in '+str(path))
+        if override:
+            valid = (data.get('frame_id') == 'map' and isinstance(poses,dict)
+                     and (set(poses) <= set(SORTING) if inventory else set(poses) == set(SORTING)))
+            if not valid:
+                reason = ('invalid map-frame pickup approaches in ' if inventory
+                          else 'four map-frame pickup approaches required in ')
+                raise ValueError(reason+str(path))
         if isinstance(poses,list):
             names = [p['name'] for p in poses]
             if len(names) != len(set(names)):
@@ -125,8 +146,27 @@ def mission_stations(root, config, binding):
     if config.get('additional_waypoints_file'):
         read_resource(config['additional_waypoints_file'], 'supplemental_record', optional=True)
     if config.get('pickup_stations_file'):
+        if inventory:
+            # The formal consumer requires this complete override. Leaving a
+            # legacy pose in the inventory would hide a missing configured point.
+            for name in SORTING:
+                points.pop(name,None)
         read_resource(config['pickup_stations_file'], 'configured_pickup_approach', override=True)
     return points
+
+
+def candidate_inventory(directory, stations, grid, image_digest):
+    """Overlay a selected recording session for offline review only."""
+    directory = Path(directory)
+    if not directory.is_dir():
+        raise FileNotFoundError('candidate session not found: '+str(directory))
+    reviewed = dict(stations)
+    for name in STATIONS:
+        path = directory/(name+'.json')
+        if path.is_file():
+            record = load_candidate(path,name,grid,image_digest)
+            reviewed[name] = dict(record, reviewed_as='OFFLINE_CANDIDATE', formal_resource=False)
+    return reviewed
 
 
 def load_start(root, grid):
