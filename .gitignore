@@ -28,3 +28,6 @@ __pycache__/
 /devel/
 /src/suat_mission/config/selected_map.yaml
 /src/suat_mission/assets/templates/
+/src/suat_mission/zone/_tpl/
+/src/suat_mission/zone/zone_markers/
+/.trash/

@@ -3,6 +3,7 @@ import math
 from pathlib import Path
 
 PROFILES = {
+    'pickup': {'linear': .025, 'angular': .20, 'accel_linear': .20, 'accel_angular': .60},
     'slow': {'linear': .08, 'angular': .30, 'accel_linear': .20, 'accel_angular': .60},
     'normal': {'linear': .12, 'angular': .45, 'accel_linear': .25, 'accel_angular': .80},
     'fast': {'linear': .20, 'angular': .60, 'accel_linear': .30, 'accel_angular': 1.0},
@@ -12,6 +13,8 @@ PLANNER_MODES = ('rollout', 'dwa')
 CONTROLLER_HZ = 10.0
 PLANNER_NAMESPACE = '/move_base/DWAPlannerROS'
 LOCAL_PLANNER_PLUGIN = 'dwa_local_planner/DWAPlannerROS'
+BOARD_POSITION = 'board_position'
+BOARD_HEADING = 'board_heading'
 
 
 def configured_global_planner(root, mode):
@@ -39,18 +42,23 @@ PLANNER_COMMON = {
 }
 
 
-def local_planner_settings(mode, approach=False, xy_tolerance=.04):
-    if mode == 'rollout':
+def local_planner_settings(mode, approach=False, xy_tolerance=.04, *, comparison=False,
+                           track_front=False):
+    if mode not in PLANNER_MODES:
+        raise ValueError('local planner must be rollout or dwa')
+    if mode == 'rollout' or comparison:
         # Noetic bounds forward rollout samples by goal distance / sim_time.
         # With a 4 cm goal tolerance, 3 s excludes the 0.02 m/s minimum
         # translation before the goal is accepted. The 1.5 s approach avoids it.
-        horizon=3.
+        settings = dict(PLANNER_COMMON, use_dwa=mode == 'dwa', sim_time=3., vx_samples=11)
         if approach:
-            horizon=max(1/CONTROLLER_HZ,min(1.5,.8*xy_tolerance/PLANNER_COMMON['min_vel_trans']))
-        return dict(PLANNER_COMMON, use_dwa=False, sim_time=horizon, vx_samples=11)
-    if mode == 'dwa':
-        return dict(PLANNER_COMMON, use_dwa=True, sim_time=1.2 if approach else 1.7, vx_samples=8)
-    raise ValueError('local planner must be rollout or dwa')
+            settings['sim_time'] = max(1/CONTROLLER_HZ,
+                                       min(1.5, .8*xy_tolerance/PLANNER_COMMON['min_vel_trans']))
+            # Score the base center while approaching a precise station pose.
+            if not track_front:
+                settings['forward_point_distance'] = 0.
+        return settings
+    return dict(PLANNER_COMMON, use_dwa=True, sim_time=1.2 if approach else 1.7, vx_samples=8)
 
 
 def settings_match(actual, expected):
@@ -64,23 +72,28 @@ def settings_match(actual, expected):
     return True
 
 
-def planner_profile_matches(actual, mode):
+def planner_profile_matches(actual, mode, *, comparison=False):
     """Recognize a cruise setup or the last stopped approach setup."""
     tolerance=actual.get('xy_goal_tolerance',.04)
     if type(tolerance) not in (int,float) or not math.isfinite(tolerance) or tolerance<=0:
         return False
-    return (settings_match(actual,local_planner_settings(mode))
-            or settings_match(actual,local_planner_settings(mode,True,tolerance)))
+    return (settings_match(actual,local_planner_settings(mode,comparison=comparison))
+            or settings_match(actual,local_planner_settings(mode,True,tolerance,comparison=comparison))
+            or settings_match(actual,local_planner_settings(mode,True,tolerance,comparison=comparison,
+                                                            track_front=True)))
 
 
 def speed_profile(name):
     if name not in PROFILES:
-        raise ValueError('speed must be slow, normal or fast')
+        raise ValueError('unknown navigation speed profile: '+str(name))
     return dict(PROFILES[name])
 
 
-def planner_speed_limits(name):
+def planner_speed_limits(name, *, turn_only=False):
     profile = speed_profile(name)
+    if turn_only:
+        return {'max_vel_x': 0., 'max_vel_trans': 0.,
+                'max_vel_theta': min(profile['angular'], .20)}
     return {'max_vel_x': profile['linear'], 'max_vel_trans': profile['linear'],
             'max_vel_theta': profile['angular']}
 

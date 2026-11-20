@@ -79,6 +79,10 @@ class PickupGeometry:
         return point
 
     def contact(self, detection):
+        return self.check_pose(self.contact_target(detection))
+
+    def contact_target(self, detection):
+        """Observed contact target before evaluating the stopped arm's reach."""
         point, _ = self.grasp_projection(detection)
         layer = 2 if detection.label == 'cake' else 1
         height = float(self.values.get('object_height_mm', {}).get(detection.label, 100.))
@@ -87,7 +91,7 @@ class PickupGeometry:
         if abs(point[2]-(support+layer*height)) > tolerance:
             raise GeometryUnavailable('observed top has the wrong layer height')
         # xyz is the physical top, not the end-effector command: add the tool once.
-        return self.check_pose([point[0], point[1], point[2]+self.cup_offset])
+        return [point[0], point[1], point[2]+self.cup_offset]
 
     def grasp_projection(self, detection):
         """Select only contact XY; RGB-D surface/height/holding checks remain."""
@@ -114,7 +118,19 @@ class PickupGeometry:
         if self.work is None:return 0.,0. # Firmware IK handles the full approach path in this mode.
         (x,y,_),_=self.grasp_projection(detection)
         xmin,xmax,ymin,ymax = self.work
+        if detection.label=='cake' and self.values.get('reachable_top_selection') is True:
+            xmax=self.number('cake_forward_limit_mm')
         return x-min(xmax,max(xmin,x)), y-min(ymax,max(ymin,y))
+
+    def pickup_options(self, detection):
+        """Keep the measured central point first, then other supported cup placements."""
+        yield detection
+        if (self.values.get('reachable_top_selection') is not True
+                or self.values.get('grasp_xy_source','dlt') != 'dlt'):
+            return
+        from dataclasses import replace
+        for option in detection.surface.get('alternate_suction_points', ()):
+            yield replace(detection, surface=dict(detection.surface, **option))
 
     def release(self, zone, label, slot=0):
         poses = self.values.get('drop_slots_arm_mm', {}).get(zone, [])
@@ -225,17 +241,24 @@ def fit_top_surface(depth_mm, camera_matrix, bbox, geometry, label, expected_top
         return a@ray*((plane_d-float(normal@b))/denominator)+b
     point=intersect((u,v))
     contours=cv2.findContours(mask,cv2.RETR_LIST,cv2.CHAIN_APPROX_SIMPLE)[-2]
-    margins=[]
+    segments = []
     for contour in contours:
-        polygon=[intersect(p) for p in contour.reshape(-1,2)]
-        for left,right in zip(polygon,polygon[1:]+polygon[:1]):
-            edge=right-left; length=float(edge@edge)
-            t=min(1.,max(0.,float((point-left)@edge)/length)) if length else 0.
-            margins.append(float(np.linalg.norm(point-(left+t*edge))))
-    margin=min(margins) if margins else 0.
+        polygon = [intersect(p) for p in contour.reshape(-1,2)]
+        segments.extend(zip(polygon, polygon[1:]+polygon[:1]))
+    if not segments:
+        raise GeometryUnavailable('observed top has no boundary')
+    starts,ends=np.asarray(segments).transpose(1,0,2)
+    edges=ends-starts
+    edge_sq=np.maximum(np.sum(edges*edges,axis=1),1e-12)
+
+    def boundary_distance(xyz):
+        frac=np.clip(np.sum((xyz-starts)*edges,axis=1)/edge_sq,0.,1.)
+        return float(np.linalg.norm(xyz-starts-edges*frac[:,None],axis=1).min())
+
+    margin=boundary_distance(point)
     if require_fit and margin<geometry.cup_radius:
         raise GeometryUnavailable('visible top is too narrow for the suction cup')
-    return {'top_face':True,'calibration_id':geometry.calibration_id,
+    result = {'top_face':True,'calibration_id':geometry.calibration_id,
             'arm_xyz_mm':point.tolist(),'grasp_point_arm_mm':point.tolist(),
             'normal_arm':normal.tolist(),'edge_margin_mm':margin,
             'plane_residual_mm':float(np.median(abs((points-centre)@normal))),
@@ -245,6 +268,24 @@ def fit_top_surface(depth_mm, camera_matrix, bbox, geometry, label, expected_top
             'plane_normal_arm':normal.tolist(),'plane_offset_arm_mm':plane_d,
             'support_polygon_arm_mm':[intersect(p).tolist() for p in cv2.convexHull(supported).reshape(-1,2)],
             'geometry_method':'affine_depth_baseline' if affine else 'rigid_rgbd'}
+    if require_fit and values.get('reachable_top_selection') is True:
+        # Use the actual depth component and all its boundary contours, including
+        # holes. A convex hull could let the cup bridge an occluded segment.
+        options=[]
+        min_clearance=geometry.cup_radius+float(values.get('alignment_tolerance_mm',5.))
+        for dv in range(-45,46,15):
+            for du in range(-45,46,15):
+                row,col=v+dv,u+du
+                if (not (du or dv) or not (0<=row<h and 0<=col<w)
+                        or distance[row,col]<3.):
+                    continue
+                xyz=intersect((col,row))
+                edge_mm=boundary_distance(xyz)
+                if edge_mm>=min_clearance:
+                    options.append(dict(grasp_point_arm_mm=xyz.tolist(),
+                        grasp_pixel=[int(col),int(row)],edge_margin_mm=edge_mm))
+        result['alternate_suction_points']=options
+    return result
 
 
 def observe_payload_volume(depth_mm, camera_matrix, geometry, arm_pose_mm, label, object_id):

@@ -174,17 +174,22 @@ class Mission:
             if callable(getattr(self.robot, 'prepare_observation', None)):
                 self.robot.prepare_observation('objects')
             self._check()
-            candidates = self.world.observe(self.robot.detect_objects())
-            self._check()
-            candidates = [d for d in candidates if d.label in labels and d.graspable is not False
-                          and not d.occluded_by and select_target([d], d.label,
-                          self.config.target_thresholds.get(d.label, self.config.target_threshold),
-                          self.config.target_roi) is not None]
-            if candidates:
+            pickup_scenes = getattr(self.robot, 'pickup_scenes', None)
+            scenes = pickup_scenes() if callable(pickup_scenes) else (self.robot.detect_objects(),)
+            for scene in scenes:
+                self._check()
+                candidates = self.world.observe(scene)
+                candidates = [d for d in candidates if d.label in labels and d.graspable is not False
+                              and not d.occluded_by and select_target([d], d.label,
+                              self.config.target_thresholds.get(d.label, self.config.target_threshold),
+                              self.config.target_roi) is not None]
+                if not candidates:
+                    continue
                 cost = getattr(self.robot, 'delivery_cost', None)
                 if callable(cost) and 'cake' not in labels:
                     return min(candidates, key=lambda d: (cost(d, self.report.board[d.label]), -d.score))
                 return max(candidates, key=lambda d: d.score)
+            self._event('pickup_station_no_target:' + waypoint)
         return None
 
     def _empty_confirmed(self):

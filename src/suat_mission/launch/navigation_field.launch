@@ -7,6 +7,7 @@
   <arg name="speed_profile" default="slow"/>
   <arg name="navigation_owner" default="/suat_field_navigation"/>
   <arg name="mission_keepout" default="false"/>
+  <arg name="keepout_file" default="data/navigation/central_pickup_keepout.json"/>
   <arg name="max_v" default="0.08"/>
   <arg name="max_w" default="0.30"/>
   <arg name="accel_v" default="0.20"/>
@@ -51,7 +52,7 @@
     <param name="DWAPlannerROS/acc_lim_x" value="$(arg accel_v)" type="double"/>
     <param name="DWAPlannerROS/acc_lim_trans" value="$(arg accel_v)" type="double"/>
     <param name="DWAPlannerROS/acc_lim_theta" value="$(arg accel_w)" type="double"/>
-    <param name="DWAPlannerROS/latch_xy_goal_tolerance" value="false" type="bool"/>
+    <param unless="$(arg rollout_candidate)" name="DWAPlannerROS/latch_xy_goal_tolerance" value="false" type="bool"/>
     <param name="DWAPlannerROS/scaling_speed" value="$(arg max_v)" type="double"/>
     <param name="oscillation_timeout" value="20.0" type="double"/>
     <param name="controller_patience" value="5.0" type="double"/>
@@ -63,6 +64,7 @@
     <param name="speed_profile" value="$(arg speed_profile)"/>
     <param name="navigation_owner" value="$(arg navigation_owner)"/>
     <param name="mission_keepout" value="$(arg mission_keepout)"/>
+    <param name="keepout_file" value="$(arg keepout_file)"/>
     <param name="profile" value="field_$(arg planner_mode)"/>
   </node>
 </launch>

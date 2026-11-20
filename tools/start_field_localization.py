@@ -7,6 +7,8 @@ from pathlib import Path
 import socket
 import subprocess
 import sys
+import threading
+import time
 import xmlrpc.client
 
 ROOT=Path(__file__).resolve().parents[1]
@@ -14,6 +16,46 @@ sys.path.insert(0,str(ROOT/'src/suat_mission/src'))
 from suat_mission.navigation_map import load_binding
 from suat_mission.map_identity import map_identity
 from suat_mission.start_pose import read_start_pose,validate_start_pose
+from suat_mission.navigation.field_alignment import static_transform_args
+
+
+def open_rviz_when_ready(root, finished, display=':0', timeout=20.0):
+    """Open the existing visualization after this launch starts map and AMCL."""
+    config=root/'reports/navigation_20261115_46dd5d73a659/new_map_localization.rviz'
+    if not config.is_file():
+        print('[RViz] 配置文件不存在：%s；定位栈继续运行' % config, file=sys.stderr, flush=True)
+        return
+    master=xmlrpc.client.ServerProxy(os.environ.get('ROS_MASTER_URI','http://localhost:11311'))
+    deadline=time.monotonic()+timeout
+    while not finished.is_set() and time.monotonic()<deadline:
+        try:
+            code,_,state=master.getSystemState('/suat_field_rviz_start')
+            nodes={n for _,owners in state[0]+state[1]+state[2] for n in owners} if code==1 else set()
+            if '/map_server' in nodes and '/amcl' in nodes:
+                if '/suat_mapping_view' in nodes:
+                    print('[RViz] 已有 /suat_mapping_view，继续使用现有窗口',flush=True)
+                    return
+                env=os.environ.copy()
+                env.update(DISPLAY=display, XAUTHORITY='/home/spark/.Xauthority')
+                try:
+                    proc=subprocess.Popen(['rviz','-d',str(config),'__name:=suat_mapping_view'],
+                        env=env,stdin=subprocess.DEVNULL,start_new_session=True)
+                except OSError as exc:
+                    print('[RViz] 启动失败：%s；定位栈继续运行' % exc,file=sys.stderr,flush=True)
+                    return
+                if finished.wait(.5):
+                    return
+                if proc.poll() is not None:
+                    print('[RViz] 窗口进程已退出，检查桌面显示及授权；定位栈继续运行',
+                          file=sys.stderr,flush=True)
+                else:
+                    print('[RViz] 已启动桌面 %s 的地图、激光、相机与路径窗口' % display,flush=True)
+                return
+        except (OSError,xmlrpc.client.Error):
+            pass
+        finished.wait(.25)
+    if not finished.is_set():
+        print('[RViz] 等待地图和 AMCL 超时，未自动打开；定位栈继续运行',file=sys.stderr,flush=True)
 
 
 def main():
@@ -24,17 +66,24 @@ def main():
     mode.add_argument('--manual-initialization',action='store_true',help='new map without a saved Start_A; initialize pose before navigation')
     parser.add_argument('--workspace-root',type=Path,default=ROOT)
     parser.add_argument('--defer-settle',action='store_true',help='let the competition launcher perform stationary alignment')
+    parser.add_argument('--no-rviz',action='store_true',help='do not automatically open RViz when starting localization')
+    parser.add_argument('--rviz-display',default=':0',help='robot desktop X display for RViz (default: :0)')
     parser.add_argument('--describe',action='store_true',help='offline selected-map plan; Start_A/ROS/process/device checks are not performed')
     args=parser.parse_args()
     if args.describe and args.start:parser.error('--describe cannot start nodes')
     root=args.workspace_root.resolve()
     binding=load_binding(root)
+    alignment=binding.get('field_alignment')
     launch=['roslaunch',str(root/'src/suat_mission/launch/field_localization.launch'),
             'workspace_root:='+str(root),'map_file:='+binding['map_yaml']]
+    if alignment:
+        launch+=['field_transform:='+' '.join(static_transform_args(alignment)),
+                 'field_alignment_version:='+alignment['alignment_version']]
     settle=args.at_start_a and not args.defer_settle
     launch+=['settle_initialization:='+str(settle).lower()]
     if args.describe:
         print(json.dumps({'map_file':binding['map_yaml'],'map_identity':map_identity(binding),
+              'field_alignment_version':alignment['alignment_version'] if alignment else None,
               'launch_command':launch,'saved_Start_A_status':'NOT_CHECKED_OFFLINE',
               'initialization_mode':'manual_initialization' if args.manual_initialization else 'saved_Start_A',
               'requires_pose_initialization_before_navigation':args.manual_initialization,
@@ -94,6 +143,7 @@ def main():
     check=subprocess.run(command[:1]+['--nodes']+command[1:],capture_output=True,text=True,timeout=10)
     expected={'/spark_base_server','/ydlidar_g2_node','/robot_state_publisher','/joint_state_publisher','/map_server','/amcl'}
     if settle:expected.add('/suat_localization_settler')
+    if alignment:expected.add('/suat_field_alignment')
     names=set(check.stdout.split())
     if check.returncode or names!=expected:
         raise RuntimeError('minimal launch inventory differs: '+check.stdout+' '+check.stderr)
@@ -111,7 +161,14 @@ def main():
     if args.start:
         if not (args.at_start_a or args.manual_initialization):
             raise ValueError('--start requires current --at-start-a confirmation or --manual-initialization')
-        return subprocess.call(command)
+        finished=threading.Event()
+        if not args.no_rviz:
+            threading.Thread(target=open_rviz_when_ready,args=(root,finished,args.rviz_display),
+                             daemon=True).start()
+        try:
+            return subprocess.call(command)
+        finally:
+            finished.set()
     return 0
 
 

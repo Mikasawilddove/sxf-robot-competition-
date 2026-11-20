@@ -1,0 +1,95 @@
+# 正式串联执行器：现场数据由pickup_geometry_file读取，不改写旧后端的verified开关。
+execution_backend: serial_rgbd
+pickup_geometry_file: data/calibration/field_20261117/pickup_geometry_39_candidate_20261119.yaml
+recorded_route_file: data/navigation/recorded_stations_20261115.json
+additional_waypoints_file: data/waypoints/collection_bcd_candidates_20261117.json
+board_geometry_file: data/calibration/board_view_candidates/classification_arrival_20261115_03_v1.json
+# 当前 640x480 相机画面下的候选四角（左上、右上、右下、左下）。
+# 仅适用于目前观察姿态；相机、机器人或板面移动后需要重新核对。
+board_view_candidate:
+  geometry_id: classification_view_20261119_camera_candidate
+  image_size: [640, 480]
+  corners: [[35, 120], [485, 65], [510, 165], [35, 240]]
+arm_feed_mm_min: 1000.0 # 沿用连续串口执行器的值；不是已确认的固件最高速度
+max_base_alignments: 2
+max_base_adjustment_mm: 100.0
+base_alignment_tolerance_m: 0.01 # 软件请求，不代表底盘已经实测达到1cm
+manipulation_confirm_frames: 2
+holding_observation_timeout: 2.0
+max_pick_retries: 1
+allow_cake_degradation: true
+initial_cycle_budget_seconds: 120.0 # 首轮估计；之后用实际完成循环耗时更新
+# 以下开关仅供旧topic后端保留，不作为serial_rgbd的虚假就绪声明。
+hardware_ready: false
+mission_scope: full
+identity_source_verified: false # ID 在遮挡、移出视野、搬运后仍指向同一实物；现有 /objects 不提供此能力
+feedback_source_verified: false # 到位/吸附为真实独立反馈，不是指令缓存
+placement_source_verified: false # 已释放且实物在目标区内稳定，有独立结果证据
+control_chain_verified: false # 底盘最终停止链、臂保持和吸泵停止策略经过现场验收
+calibration_id: '' # 由真实几何文件提供，与实例观测一致
+board_slots_confirmed: false
+board_slots: [B, C, D] # 从相机画面左至右；需在现场确认取向。
+board_axis: x # x 表示横向，y 表示纵向
+board_reverse: false # true 表示从右向左或从下向上
+board_votes: 3
+board_frames: 8
+board_timeout: 12.0
+board_min_confidence: 0.6
+board_roi: [] # 原图[xmin,ymin,xmax,ymax]；须填ROI或board_corners，缺几何不能READY。
+target_min_confidence: 0.6
+target_frames: 5
+target_min_frames: 3
+target_max_distance_px: 35.0
+target_roi: []
+sorting_points: ["Sorting_W", "Sorting_S", "Sorting_E", "Sorting_N"]
+each_count: 3
+mission_timeout: 600.0
+judge_clock_already_running: false # explicitly choose whether the judge clock is running at preparation
+startup_delay: 0.0 # seconds already consumed at preparation (judge running), or known Enter delay otherwise
+stop_margin: 1.0 # measured/conservative stopping reserve; null blocks preparation until confirmed
+record_max_hz: 10.0 # sampled per allowlisted topic; recording load still requires on-site verification
+record_max_bytes: 1048576
+action_timeout: 60.0 # 单次导航/抓取/放置的上限，仍受整场截止约束
+observation_max_age: 2.0
+navigation_speed: slow # 与唯一导航owner所启用的停车后档位一致；不是现场已验收档位。
+navigation_timeout: 60.0
+feedback_timeout: 15.0
+observation_timeout: 5.0
+# 实测后填充 map 坐标，角度单位为弧度。
+waypoints: {}
+waypoint_map_identity: {} # 完整地图身份；须与selected_map的实际binding一致，旧资源不自动补身份。
+# 实测后填写，并验证使用高度与抓取高度一致。
+calibration_files: {} # 每个类别各填文件路径；不同抓取高度分别验证
+calibration_verified: false
+arm_bounds: [] # [xmin, xmax, ymin, ymax]，单位 mm
+arm_z_bounds: [] # [zmin, zmax]，包含抓取、抬升和放置高度
+grasp_z: {} # cake、teddybear、clock、banana 各自的目标高度 mm
+approach_offset: 0.0 # mm，必须设为现场验证过的正数
+lift_offset: 0.0 # mm，必须设为现场验证过的正数
+drop_poses: {} # A/B/C/D: [x, y, z] mm；逐区现场确认
+# 两个话题必须由实际的独立反馈源发布，禁止连接厂家指令缓存来冒充反馈。
+arm_arrived_topic: /suat/arm_arrived
+object_attached_topic: /suat/object_attached
+
+# Board geometry/direction: unknown until the actual installation is checked.
+board_direction_source: '' # 固定参照用fixed_reference；AR/场地标识须传入逐帧依据，不能只填名称。
+board_direction_reference: '' # 当前固定安装/布局的真实方向证据记录，不能为空。
+board_geometry_id: '' # 原图ROI/四角和安装/布局的版本或证据身份。
+board_image_size: [] # 真实原图[width,height]；与/objects发布前缩放坐标分开，未取得时保持未知。
+board_corners: [] # 可选原图四角：归一化左上、右上、右下、左下；非空时覆盖矩形ROI。
+board_normalized_size: [300, 100] # 仅处理输出像素，不是板面/相机实测尺寸。
+board_slot_edges: [0.0, 0.3333333333333333, 0.6666666666666666, 1.0] # 归一化x分槽，布局适用性须现场核对。
+board_detector_source: '' # 核实正式生产链后填formal_template或formal_hybrid；声明本身不证明发布者。
+board_detector_publisher: '' # /objects实际callerid；未知或与收到消息不符时拒绝投票。
+board_image_topic: /camera/color/image_raw # 沿用已跑过的原图入口；实际接线由相机端确认
+board_score_semantics: '' # 普通板图案正式模板分数须为TM_CCOEFF_NORMED。
+
+# 现场临时规避（2026-11-17）：recorder 以 AnyMsg 订阅与 Navigator 的 String 订阅同话题时，
+# 本进程内 Navigator.on_state 收到 AnyMsg 导致 fresh output state missing。
+# 暂从记录清单移除 /suat/navigation/state，其余仍记录；待核心端修类型/顺序后删除本覆盖。
+record_topics: ['/suat/mission/command', '/suat/mission/stop', '/suat/perception/instances', '/suat/manipulation/active', '/move_base/result', '/cmd_vel']
+board_station_records_file: data/waypoints/corner_20261115_A_03_candidates.json
+
+# Explicit candidate files; default launch resources remain separate.
+pickup_stations_file: data/waypoints/pickup_stations_39_candidate_20261119.json
+navigation_keepout_file: data/navigation/central_pickup_keepout_39_candidate_20261119.json

@@ -163,7 +163,9 @@ class RosRobot:
             root = Path(__file__).resolve().parents[5]
             self._navigator = Navigator(root, self._param('navigation_speed', 'slow'),
                                         owner='/suat_mission', health_check=self._ensure_running,
-                                        planner_mode=self._param('navigation_planner_mode') or None)
+                                        planner_mode=self._param('navigation_planner_mode') or None,
+                                        keepout_file=self._param('navigation_keepout_file',
+                                            'data/navigation/central_pickup_keepout.json'))
         return self._navigator
 
     def prepare_navigation(self):
@@ -477,12 +479,16 @@ class RosRobot:
         pass
 
     def _navigate(self, name, remaining):
+        from suat_mission.navigation.pickup_keepout import is_pickup_station
         self._ensure_running()
         navigator = self._get_navigator()
         item = {'name': name, 'pose': list(self.points[name])}
+        candidate = (name == 'Classification_area' or name in getattr(self, 'board_candidates', {})
+                     or name in self.scope.sorting_points)
         def make_plan(previous_attempts=None):
             try:
-                return navigator.plan(navigator.pose(), item['pose'], navigator.grid())
+                return navigator.plan(navigator.pose(), item['pose'], navigator.grid(),
+                                      pickup_station=is_pickup_station(navigator.keepout,name))
             except NavigationPlanError as exc:
                 report={'passed':False,'phase':'planning','target':item,
                         'error':str(exc),'rejected_plan':exc.plan,
@@ -496,12 +502,7 @@ class RosRobot:
         try:
             plan = make_plan()
         except NavigationPlanError as exc:
-            candidate = (name == 'Classification_area' or name in getattr(self, 'board_candidates', {})
-                         or name in self.scope.sorting_points)
-            if candidate and str(exc) in (
-                    'goal body footprint is blocked on selected map', 'no complete live plan', 'one leg exceeds 8 m',
-                    'live planner returned a partial path', 'live path crosses central pickup keepout',
-                    'live path body overlaps occupied or unknown saved map cells'):
+            if candidate and str(exc) in NavigationPlanError.STATION_ERRORS:
                 return ActionResult(self.active_context, Outcome.UNREACHABLE,
                                     'no motion issued; candidate station plan refused: '+str(exc))
             raise MissionError('navigate '+name+': '+str(exc)) from exc
@@ -517,17 +518,30 @@ class RosRobot:
             # stale sensor, ownership fault or uncertain payload never retries.
             retryable=(report.get('action_terminal_state')==4 or
                        report.get('error')=='no navigation progress for 20 seconds')
-            if not report['passed'] and retryable and report.get('output_released'):
+            if retryable and navigator.can_try_next_station(report,self.active_context):
                 self._ensure_running()
                 if time.monotonic()+navigator.executor_stop_budget()<self.active_context.deadline:
-                    plan=make_plan(attempts)
-                    report=navigator.execute_leg(item,plan,context=self.active_context,station_approach=True)
+                    try:
+                        plan=make_plan(attempts)
+                    except NavigationPlanError as exc:
+                        if not candidate or str(exc) not in NavigationPlanError.STATION_ERRORS:
+                            raise
+                        report=dict(report,error=str(exc),rejected_plan=exc.plan,
+                                    candidate_unreachable=True)
+                    else:
+                        plan['timeout_s']=min(plan['timeout_s'],self.nav_timeout,
+                                              self.active_context.deadline-time.monotonic())
+                        report=navigator.execute_leg(item,plan,context=self.active_context,station_approach=True)
                     attempts.append(dict(report))
                     report['attempts']=attempts
             self.last_navigation_result = report
             sink = getattr(self, 'navigation_evidence_sink', None)
             if sink is not None:
                 sink(report)
+            if candidate and navigator.can_try_next_station(report,self.active_context):
+                self._ensure_running()
+                navigator.connect_control()
+                return ActionResult(self.active_context, Outcome.UNREACHABLE, json.dumps(report))
             outcome = Outcome.CONFIRMED if report['passed'] else Outcome.FAILED
             return ActionResult(self.active_context, outcome, json.dumps(report, ensure_ascii=True))
         finally:
@@ -583,6 +597,7 @@ class SerialRosRobot(RosRobot):
         self.observation_timeout=float(self._param('observation_timeout',5.))
         self.serial_runtime=SerialMissionRuntime(root,self.config,self._serial_scene,
             lambda: RosRobot._ensure_running(self,check_attachment=False),self._align_base)
+        self._empty_travel_prepared = False
 
     def _serial_scene(self, after, deadline):
         with self.cv:
@@ -606,9 +621,25 @@ class SerialRosRobot(RosRobot):
 
     def prepare_observation(self, kind):
         self._require_stopped_base()
+        deadline = min(self.deadline, time.monotonic()+float(self._param('action_timeout',60.)))
         if kind=='objects':
-            self.serial_runtime.bootstrap(min(self.deadline,time.monotonic()+float(self._param('action_timeout',60.))))
-        self.serial_runtime.observation(kind,min(self.deadline,time.monotonic()+float(self._param('action_timeout',60.))))
+            self.serial_runtime.bootstrap(deadline)
+        self.serial_runtime.observation(kind,deadline)
+
+    def pickup_scenes(self):
+        """Allow the same side-view tracker used by the stationary entry to settle."""
+        end = min(self.deadline, time.monotonic()+self.observation_timeout)
+        received = False
+        while time.monotonic() < end:
+            try:
+                scene = self.serial_runtime.fresh_scene(end)
+            except TimeoutError:
+                if not received:
+                    raise
+                return
+            self.selected_scene = scene
+            received = True
+            yield scene
 
     def set_deadline(self,value):
         super().set_deadline(value)
@@ -652,16 +683,31 @@ class SerialRosRobot(RosRobot):
 
     def _align_base(self, dx_mm, dy_mm, parent, index):
         from suat_mission.contracts import ActionContext
-        navigator=self._get_navigator();start=navigator.pose()
+        self._require_stopped_base()
+        if self.serial_runtime.held is not None or self.serial_runtime.session.pump_may_be_on:
+            raise MissionError('pickup adjustment requires an empty travel pose and pump off')
+        navigator=self._get_navigator()
+        start=navigator.pose()
         mount=self.serial_runtime.geometry.number('arm_yaw_in_base_rad')
         turn=start[2]+mount;c,s=math.cos(turn),math.sin(turn)
         goal=[start[0]+(c*dx_mm-s*dy_mm)/1000.,start[1]+(s*dx_mm+c*dy_mm)/1000.,start[2]]
         child=ActionContext(parent.run_id,parent.goal_id+':base:'+str(index),'navigate',
             parent.object_id,parent.scene_version,parent.deadline)
-        plan=navigator.plan(start,goal,navigator.grid())
+        grid=navigator.grid()
+        precise=navigator.keepout is not None and navigator.keepout.precise_pickup
+        try:
+            plan=navigator.plan(start,goal,grid,pickup_approach=precise)
+        except NavigationPlanError as exc:
+            if not precise and str(exc) not in NavigationPlanError.STATION_ERRORS:
+                raise
+            return {'passed':False,'pickup_plan_refused':True,'motion_goal_sent':False,
+                    'error':str(exc),'rejected_plan':exc.plan}
         plan['timeout_s']=min(plan['timeout_s'],max(0.,parent.deadline-time.monotonic()))
-        return navigator.execute_leg({'name':'pickup_align','pose':goal},plan,context=child,
+        report=navigator.execute_leg({'name':'pickup_align','pose':goal},plan,context=child,
             phase='align',xy_tolerance=float(self._param('base_alignment_tolerance_m',.01)),yaw_tolerance=.05)
+        if report['passed']:
+            self._require_stopped_base()
+        return report
 
     def _pick(self, target, label):
         self._require_stopped_base()
@@ -679,12 +725,20 @@ class SerialRosRobot(RosRobot):
         return self.serial_runtime.confirm_empty(self.latest_scene, self.deadline)
 
     def _before_navigation(self, name):
-        if self.serial_runtime.held is None:
+        runtime = self.serial_runtime
+        if runtime.held is None:
             self._require_stopped_base()
-            self.serial_runtime.open()
-            self.serial_runtime.move('empty_travel',self.serial_runtime.geometry.values['empty_travel_pose_mm'],
-                min(self.active_context.deadline,self.deadline))
-        self.serial_runtime.event('navigate',station=name)
+            runtime.open()
+            deadline = min(self.active_context.deadline,self.deadline)
+            if not self._empty_travel_prepared:
+                runtime.prepare_empty_observation(
+                    self._param('arm_unfold_pose_mm', (191.74, -0.30, 124.09)), deadline,
+                    fold_feed_limit=float(self._param('arm_fold_feed_mm_min', 1000.)))
+                self._empty_travel_prepared = True
+            travel = runtime.geometry.values['empty_travel_pose_mm']
+            if math.dist(runtime.arm_pose,travel) > runtime.session.correction_tolerance_mm:
+                runtime.move('empty_travel',travel,deadline)
+        runtime.event('navigate',station=name)
 
     def delivery_cost(self, target, zone):
         x,y,_=self._get_navigator().pose();gx,gy,_=self.points['Collection_'+zone]
@@ -820,9 +874,10 @@ class Node:
     def _make_recorder(self):
         root=Path(__file__).resolve().parents[5]
         config=self.config;selected=scope_from_config(config)
-        paths=[Path(__file__).resolve(),root/'src/suat_mission/src/suat_mission/automation/mission.py',
-               root/'src/suat_mission/src/suat_mission/serial_mission.py',
-               root/'src/suat_mission/src/suat_mission/navigation_ros.py']
+        source=Path(__file__).resolve().parents[1]
+        paths=[Path(__file__).resolve(),source/'automation/mission.py',source/'automation/serial_mission.py',
+               source/'manipulation/arm_session.py', source/'vision/mission_scene_node.py',
+               source/'vision/experimental_vision.py',source/'navigation/navigation_ros.py']
         metadata={name:config.get(name) for name in ('operator','layout_id','calibration_id','execution_backend')}
         metadata.update(entrypoint=str(Path(__file__).resolve()),speed_profile=config['navigation_speed'],
             code_files={str(p):file_identity(p) for p in paths},

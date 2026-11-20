@@ -7,6 +7,7 @@ catkin_install_python(PROGRAMS scripts/mission_node.py scripts/mission_console.p
 install(DIRECTORY launch config assets DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION})
 catkin_install_python(PROGRAMS scripts/localization_settler.py DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION})
 catkin_install_python(PROGRAMS scripts/mission_scene_node.py DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION})
+catkin_install_python(PROGRAMS scripts/arm_pick_place.py DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION})
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/scripts/field_perception_node.py")
   catkin_install_python(PROGRAMS scripts/field_perception_node.py DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION})
 endif()

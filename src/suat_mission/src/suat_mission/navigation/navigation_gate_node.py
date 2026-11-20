@@ -22,7 +22,7 @@ from std_srvs.srv import Trigger, TriggerResponse
 
 from suat_mission.navigation.navigation_gate import NavigationGate, navigation_clients_fault, motion_bounds_fault
 from suat_mission.navigation.navigation_map import load_binding, verify_map
-from suat_mission.navigation.pickup_keepout import PLANNING_MAP_TOPIC, PickupKeepout
+from suat_mission.navigation.pickup_keepout import KEEP_OUT_FILE, PLANNING_MAP_TOPIC, PickupKeepout
 from suat_mission.navigation.navigation_profiles import speed_profile, path_travel_fault
 from suat_mission.navigation.corner_egress import (
     DISTANCE, SPEED, SweepBlocked, anchor_check, check_rear_clearance,
@@ -73,10 +73,11 @@ class Node:
         self.binding = load_binding(Path(rospy.get_param('~workspace_root')))
         self.workspace_root = Path(rospy.get_param('~workspace_root'))
         self.keepout = None
+        self.keepout_file = rospy.get_param('~keepout_file',KEEP_OUT_FILE)
         self.planning_map_pub = None
         self.map_xy = None
         if rospy.get_param('~mission_keepout',False):
-            self.keepout = PickupKeepout.load(self.workspace_root,self.binding)
+            self.keepout = PickupKeepout.load(self.workspace_root,self.binding,self.keepout_file)
             self.keepout_radius = float(rospy.get_param('/move_base/global_costmap/robot_radius',.20)) + float(
                 rospy.get_param('/move_base/global_costmap/footprint_padding',.02))
             if not math.isfinite(self.keepout_radius) or self.keepout_radius<=0:
@@ -263,8 +264,11 @@ class Node:
                 if not self.owner_request(request):raise ValueError('only configured navigation owner may arm')
                 if not self.inputs_clear():raise ValueError('previous navigation inputs are not zero')
                 caps=None
-                if self.owner=='/suat_mission' and rospy.get_param('~station_approach',False) is True:
-                    approach=speed_profile('slow')
+                phase=rospy.get_param('~station_approach',False)
+                if self.owner=='/suat_mission' and (phase is True or phase=='pickup'):
+                    if phase=='pickup' and (self.keepout is None or not self.keepout.precise_pickup):
+                        raise ValueError('pickup approach requires the matching keepout profile')
+                    approach=speed_profile('pickup' if phase=='pickup' else 'slow')
                     caps=(approach['linear'],approach['angular'])
                 token = self.gate.arm(time.monotonic(), self.health(True, True),caps=caps)
                 self.start_odom_pose = self.odom[5:8]
@@ -618,6 +622,7 @@ class Node:
                         'mode':self.mode,'speed_profile':self.speed_name,'travel_m':self.travel,
                         'owner':self.owner,'inputs_clear':self.inputs_clear(),
                         'mission_keepout':self.keepout is not None,
+                        'keepout_file':self.keepout_file,
                         'active_goal':None if self.goals is None else self.goals[1],
                         'health': self.health(), 'egress':None if self.egress is None else {
                             'id':self.egress['id'], 'status':self.egress['status'], 'distance_m':self.egress['distance'],

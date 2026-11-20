@@ -104,3 +104,11 @@ def transform_pose(alignment, pose, binding, inverse=False, expected_version=Non
         dx,dy=x-tx,y-ty
         return [float(c*dx+s*dy),float(-s*dx+c*dy),wrap_angle(float(yaw-theta))]
     return [float(c*x-s*y+tx),float(s*x+c*y+ty),wrap_angle(float(yaw+theta))]
+
+
+def static_transform_args(alignment):
+    """Arguments for Noetic's static map → field transform publisher."""
+    x, y = alignment['translation_m']
+    half_yaw = alignment['theta_rad'] / 2
+    return [str(x), str(y), '0', '0', '0', str(math.sin(half_yaw)),
+            str(math.cos(half_yaw)), 'map', 'field']

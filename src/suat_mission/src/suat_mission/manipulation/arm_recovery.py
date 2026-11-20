@@ -8,18 +8,20 @@ from suat_mission.contracts import ActionContext
 
 
 def matched_reply_or_fault(frames,sequence,sent_at):
-    """A normal numbered reply must never hide a fresh controller/parse fault."""
+    """A normal reply must never hide a fresh controller/parse fault."""
     for frame in frames:
         if frame.received_at>=sent_at and frame.kind in ('unknown','invalid','unnumbered_error','error'):
             raise ValueError('arm protocol fault: '+frame.raw)
+    reply_kind = 'unnumbered_reply' if sequence is None else 'reply'
     matches=[frame for frame in frames if frame.sequence==sequence
-             and frame.first_byte_at>=sent_at and frame.kind=='reply']
+             and frame.first_byte_at>=sent_at and frame.kind==reply_kind]
     if len(matches)>1:raise ValueError('multiple replies for one arm request')
     return matches[0] if matches else None
 
 
 def recover_pose(io,target,context,*,tolerance_mm,max_moves,stop_budget_s,
-                 max_correction_step_mm=None,max_command_offset_mm=None):
+                 max_correction_step_mm=None,max_command_offset_mm=None, previous_move_at=None,
+                 stop_after_success=True):
     if (not isinstance(context,ActionContext) or len(target)!=3
             or not all(type(v) in (int,float) and math.isfinite(v) for v in target)
             or not math.isfinite(tolerance_mm) or tolerance_mm<=0
@@ -33,12 +35,12 @@ def recover_pose(io,target,context,*,tolerance_mm,max_moves,stop_budget_s,
                        for v in (max_correction_step_mm,max_command_offset_mm))):
         raise ValueError('feedback compensation needs explicit positive step and total command limits')
     report={'outcome':'failed','target_xyz':list(target),'tolerance_mm':tolerance_mm,
-            'max_moves':max_moves,'measurements':[],'moves':[],'motion_commands_sent':False,
+            'max_moves':max_moves,'measurements':[],'moves':[],'motion_commands_sent':previous_move_at is not None,
             'hardware_ready':False,'absolute_tip_accuracy':'NOT_TESTED'}
     report['command_compensation']={'enabled':compensate,'max_step_mm':max_correction_step_mm,
                                     'max_offset_mm':max_command_offset_mm}
     work_deadline=context.deadline-stop_budget_s
-    latest_joint_sequence=0;last_motion_at=None
+    latest_joint_sequence=0;last_motion_at=previous_move_at
     def check(deadline=work_deadline):
         if io.now()>=deadline:raise TimeoutError('recovery work deadline reached')
     def measure(deadline=work_deadline):
@@ -68,7 +70,7 @@ def recover_pose(io,target,context,*,tolerance_mm,max_moves,stop_budget_s,
         command=list(target)
         for index in range(max_moves):
             if report['final_error_mm']<=tolerance_mm:break
-            corrected=compensate and index>0
+            corrected=compensate and (index>0 or previous_move_at is not None)
             if corrected:
                 error=[goal-measured for goal,measured in zip(target,pose['xyz'])]
                 scale=min(1.,max_correction_step_mm/math.dist(pose['xyz'],target))
@@ -95,7 +97,7 @@ def recover_pose(io,target,context,*,tolerance_mm,max_moves,stop_budget_s,
         report['error']=str(exc) or type(exc).__name__
         report['outcome']='timeout' if isinstance(exc,TimeoutError) else 'failed'
     finally:
-        if report['motion_commands_sent']:
+        if report['motion_commands_sent'] and (stop_after_success or report['outcome']!='measured_target_reached'):
             try:
                 report['stop']=io.stop(context.deadline)
                 if (report['stop'].get('acknowledged') is not True

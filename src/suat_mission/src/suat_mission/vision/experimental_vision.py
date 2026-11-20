@@ -3,6 +3,9 @@
 Scores are geometric/color-shape heuristics, not probabilities. Never use these
 outputs to drive hardware until validated on independent robot-camera scenes.
 """
+from dataclasses import replace
+from pathlib import Path
+
 import cv2
 import numpy as np
 
@@ -10,7 +13,71 @@ from suat_mission.vision.perception import Detection
 from suat_mission.vision.template_matcher import _iou
 
 
+TEMPLATE_FILES = {
+    'banana': ['banana.png'],
+    'cake': ['cake.png', 'cake_rule_reference.png'],
+    'clock': ['clock.png'],
+    'teddybear': ['teddybear.png'],
+}
+
+
+def measure_layer(rise, box, layer_rise=100.0, block_h=100.0, tol=0.25):
+    """Conservative single-frame estimate: return (layer, rise), or (None, rise).
+
+    The reference plane and heights must be independently validated.
+    """
+    if rise is None or not isinstance(rise, np.ndarray) or rise.ndim != 2:
+        return None, None
+    if not np.isfinite(layer_rise) or layer_rise <= 0 or not np.isfinite(block_h) or block_h <= 0:
+        return None, None
+    try:
+        x, y, w, h = (int(v) for v in box)
+    except (TypeError, ValueError, OverflowError):
+        return None, None
+    if w <= 0 or h <= 0:
+        return None, None
+    rows, cols = rise.shape
+    x0, x1 = max(0, x), min(cols, x + w)
+    y0, y1 = max(0, y), min(rows, y + h)
+    if x1 - x0 < 8 or y1 - y0 < 8:
+        return None, None
+    width, height = x1 - x0, y1 - y0
+    left, right = x0 + int(width * 0.10), x1 - int(width * 0.10)
+    top = y0 + int(height * 0.05)
+    bottom = y0 + max(int(height * 0.45), int(height * 0.05) + 4)
+    band = rise[top:min(bottom, y1), left:right]
+    finite = band[np.isfinite(band)]
+    if finite.size < max(40, int(np.ceil(band.size * 0.25))):
+        return None, None
+    max_layer = min(2, int(250.0 // block_h))
+    tolerance = min(max(float(tol), 0.0), 0.25) * layer_rise
+    support = [np.abs(finite - (i + 1) * layer_rise) <= tolerance
+               for i in range(max_layer + 1)]
+    counts = [int(np.count_nonzero(mask)) for mask in support]
+    winner = int(np.argmax(counts))
+    competing = max([count for i, count in enumerate(counts) if i != winner] or [0])
+    if (counts[winner] < max(40, int(np.ceil(0.60 * finite.size)))
+            or competing >= 0.20 * finite.size):
+        return None, float(np.median(finite))
+    return winner, float(np.median(finite[support[winner]]))
+
+
 class ExperimentalVision:
+    @classmethod
+    def from_template_directory(cls, directory):
+        directory = Path(directory)
+        templates = {}
+        for label, files in TEMPLATE_FILES.items():
+            images = []
+            for filename in files:
+                path = directory / filename
+                image = cv2.imread(str(path))
+                if image is None or not image.size:
+                    raise RuntimeError('template unavailable: ' + str(path))
+                images.append(image)
+            templates[label] = images
+        return cls(templates, banana_saturation_min=55)
+
     def __init__(self, templates, max_shape_distance=0.20, banana_saturation_min=80):
         if set(templates) != {'teddybear', 'clock', 'banana', 'cake'}:
             raise ValueError('four labels required')
@@ -37,6 +104,26 @@ class ExperimentalVision:
         if not contours:
             raise ValueError('banana template has no yellow contour')
         self.banana_shape = max(contours, key=cv2.contourArea)
+
+    def detect_for_target(self, image, target, min_score=0.45, min_hits=1):
+        """Use the grasp script's enhanced-image retry for a missing named target."""
+        found = [item for item in self.detect(image) if item.score >= min_score]
+        count = sum(item.label == target for item in found)
+        if count >= min_hits:
+            return found
+        light, a, b = cv2.split(cv2.cvtColor(image, cv2.COLOR_BGR2LAB))
+        light = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8)).apply(light)
+        enhanced = cv2.cvtColor(cv2.merge([light, a, b]), cv2.COLOR_LAB2BGR)
+        enhanced = cv2.resize(enhanced, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
+        recovered = [
+            replace(item, x=item.x / 2.0, y=item.y / 2.0,
+                    width=item.width / 2.0, height=item.height / 2.0)
+            for item in self.detect(enhanced)
+            if item.label == target and item.score >= min_score
+        ]
+        if len(recovered) > count:
+            return [item for item in found if item.label != target] + recovered
+        return found
 
     @staticmethod
     def _yellow_contours(image, saturation_min=80):

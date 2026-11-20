@@ -127,6 +127,12 @@ def swept_clearance(x, y, distance):
     return math.hypot(x - min(distance, max(0., x)), y)
 
 
+class LiveDepartureObstacle(ValueError):
+    def __init__(self, evidence):
+        super().__init__('new live obstacle appeared on the departure path')
+        self.evidence = evidence
+
+
 def contact_path(grid, pose, points, radius, wall_reference=None, _cache=None, static_contact=False):
     """Permit only the original connected-wall overlap until the path escapes it."""
     reached=(_cache['reached'] if _cache and 'reached' in _cache else _reachable_free(grid,pose))
@@ -179,7 +185,14 @@ def contact_path(grid, pose, points, radius, wall_reference=None, _cache=None, s
                     if wall_reference is not None:
                         wx,wy=ox+(i+.5)*r,oy+(j+.5)*r
                         if not reference_match:
-                            raise ValueError('new live obstacle appeared on the departure path')
+                            raise LiveDepartureObstacle({
+                                'cell': list(cell),
+                                'cell_center_xy': [wx, wy],
+                                'distance_to_path_center_m': d,
+                                'path_center_xy': [x, y],
+                                'reference_cell': [ri, rj],
+                                'raster_resolution_m': r,
+                            })
             if not static_contact and not escaped and all(value==0 for _,value,_ in cells):
                 escaped=True;escape_at=travel+length*step/count
         travel+=length;previous=endpoint

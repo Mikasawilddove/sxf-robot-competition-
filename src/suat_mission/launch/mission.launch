@@ -8,11 +8,13 @@
   <arg name="instances_topic" default="/suat/perception/grasp_instances"/>
   <arg name="start_grasp_observer" default="true"/>
   <arg name="start_perception" default="false"/>
+  <arg name="observation_target" default="clock"/>
   <!-- B-line owns this adapter; enable after its launch file is delivered. -->
   <include if="$(arg start_perception)" file="$(find suat_mission)/launch/field_perception.launch"/>
   <node if="$(arg start_grasp_observer)" pkg="suat_mission" type="mission_scene_node.py" name="suat_mission_scene" output="screen">
     <param name="workspace_root" value="$(arg workspace_root)"/>
     <param name="geometry_file" value="$(arg geometry_file)"/>
+    <param name="target_label" value="$(arg observation_target)"/>
   </node>
   <node pkg="suat_mission" type="mission_node.py" name="suat_mission" output="screen" clear_params="true">
     <rosparam command="load" file="$(arg config)"/>

@@ -2,7 +2,9 @@
 import math
 import threading
 from suat_mission.navigation.navigation_test_geometry import arrival_confirmed, arrival_error
-from suat_mission.navigation.navigation_profiles import path_travel_fault, planner_speed_limits
+from suat_mission.navigation.navigation_profiles import (
+    BOARD_HEADING, BOARD_POSITION, path_travel_fault, planner_speed_limits,
+)
 
 
 class NavigationExecutor:
@@ -58,7 +60,8 @@ class NavigationExecutor:
                 if work_deadline <= io.now():
                     raise ValueError('insufficient navigation deadline budget for stopped handoff')
                 io.ready()
-                if (phase not in ('coarse', 'align') or not all(math.isfinite(v) and v > 0
+                if (phase not in ('coarse', 'align', BOARD_POSITION, BOARD_HEADING)
+                        or not all(math.isfinite(v) and v > 0
                         for v in (xy_tolerance, yaw_tolerance))):
                     raise ValueError('invalid navigation phase or tolerances')
                 report['stop_requested'] = bool(io.stop())
@@ -71,11 +74,12 @@ class NavigationExecutor:
                 if controller_speed is None:
                     configured = io.configure(xy_tolerance, yaw_tolerance)
                 else:
-                    limits = planner_speed_limits(controller_speed)
+                    limits = planner_speed_limits(controller_speed, turn_only=phase == BOARD_HEADING)
                     expected.update(limits)
                     report['controller_speed_profile'] = controller_speed
                     report['controller_limits'] = limits
-                    configured = io.configure(xy_tolerance, yaw_tolerance, controller_speed=controller_speed)
+                    configured = io.configure(xy_tolerance, yaw_tolerance,
+                                              controller_speed=controller_speed, phase=phase)
                 if any(key not in configured or not math.isfinite(float(configured[key]))
                        or abs(float(configured[key])-value) > 1e-8 for key,value in expected.items()):
                     raise ValueError('planner configuration readback differs from requested phase')
@@ -83,7 +87,8 @@ class NavigationExecutor:
                     report['local_planner_mode']='dwa' if configured['use_dwa'] else 'rollout'
                     report['sampling_readback']={key:configured[key] for key in (
                         'sim_time','sim_granularity','angular_sim_granularity','vx_samples','vth_samples',
-                        'path_distance_bias','goal_distance_bias','occdist_scale') if key in configured}
+                        'path_distance_bias','goal_distance_bias','occdist_scale',
+                        'forward_point_distance') if key in configured}
                 if cancel_distance is not None and (not math.isfinite(cancel_distance) or
                                                      not .03 <= cancel_distance <= .50):
                     raise ValueError('cancel distance must be .03..0.50 metres')
@@ -122,6 +127,8 @@ class NavigationExecutor:
                     # The state topic updates asynchronously after arm. Preparation
                     # and dynamic reconfigure must not consume that startup window.
                     if io.now()-armed_at > .35 and sample['gate_state'] != 'ARMED':
+                        report['gate_stop_reason'] = sample.get('gate_reason')
+                        report['gate_health'] = sample.get('gate_health')
                         raise ValueError('navigation output gate stopped')
                     current = sample['odom_pose']
                     if previous is not None:
@@ -134,6 +141,10 @@ class NavigationExecutor:
                                   linear_mps=sample['linear'], angular_radps=sample['angular'], travel_m=travel)
                     report['peak_linear_mps']=max(report.get('peak_linear_mps',0.),abs(sample['linear']))
                     report['peak_angular_radps']=max(report.get('peak_angular_radps',0.),abs(sample['angular']))
+                    xy, angle = arrival_error(item['pose'], sample['pose'])
+                    report['closest_position_error_m'] = min(report.get('closest_position_error_m', xy), xy)
+                    if xy <= xy_tolerance and 'position_tolerance_entered_s' not in report:
+                        report['position_tolerance_entered_s'] = io.now()-started
                     if cancel_distance is not None and math.dist(current[:2], origin[:2]) >= cancel_distance:
                         io.stop()
                         io.cancel_owned()
@@ -148,11 +159,14 @@ class NavigationExecutor:
                             io.sleep(.05)
                         break
                     if sample['status'] not in (0, 1, 6, 7):
+                        if cancel_distance is None and sample['status'] != 3:
+                            report['error'] = (sample.get('status_text') or
+                                               f"move_base ended with status {sample['status']}")
+                            report['action_terminal_error'] = report['error']
                         report['arrival_confirmed'] = sample['status'] == 3 and arrival_confirmed(
                             item['pose'], sample['pose'], sample['linear'], sample['angular'], sample['age'],
                             xy_tolerance, yaw_tolerance)
                         break
-                    xy, angle = arrival_error(item['pose'], sample['pose'])
                     if xy < best_xy-max(.002, xy_tolerance*.2) or angle < best_yaw-max(.01, yaw_tolerance*.2):
                         progress_at = io.now()
                         best_xy, best_yaw = min(best_xy, xy), min(best_yaw, angle)
@@ -197,6 +211,8 @@ class NavigationExecutor:
                             xy_tolerance, yaw_tolerance))
                     report.update(actual_pose=list(fresh['pose']), linear_mps=fresh['linear'],
                                   angular_radps=fresh['angular'])
+                    if not report['arrival_confirmed']:
+                        report['error'] = 'stopped arrival readback is outside tolerance or stale'
                 except Exception as exc:
                     report['arrival_confirmed'] = False
                     report['error'] = 'stopped arrival readback failed: '+str(exc)

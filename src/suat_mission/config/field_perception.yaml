@@ -1,0 +1,46 @@
+# 生产相机适配（B 线，2026-11-17）。只读节点：不发布运动、机械臂、吸泵命令。
+# 部署位置：src/suat_mission/config/field_perception.yaml
+image_topic: /camera/color/image_raw
+aligned_depth_topic: /camera/aligned_depth_to_color/image_raw
+color_info_topic: /camera/color/camera_info
+depth_info_topic: /camera/aligned_depth_to_color/camera_info
+sync_slop: 0.12
+objects_topic: /objects
+# /objects 明确选择分拣全图或分类板；可通过 rosparam 运行时切换。
+objects_mode: sorting
+sorting_objects_topic: /suat/perception/sorting_objects
+board_objects_topic: /suat/perception/board_objects
+sorting_observations_topic: /suat/perception/sorting_observations
+instances_topic: /suat/perception/instances
+status_topic: /suat/perception/status
+# 必须与正式任务使用的已验证标定一致；为空时不发布正式实例快照。
+calibration_id: ''
+templates:
+  clock: [/home/spark/SUAT/spark/src/suat_mission/assets/templates/clock.png]
+  teddybear: [/home/spark/SUAT/spark/src/suat_mission/assets/templates/teddybear.png]
+  banana: [/home/spark/SUAT/spark/src/suat_mission/assets/templates/banana.png]
+  cake: [/home/spark/SUAT/spark/src/suat_mission/assets/templates/cake.png, /home/spark/SUAT/spark/src/suat_mission/assets/templates/cake_rule_reference.png]
+method: template
+image_scale: 1.0
+threshold: 0.6
+scales: [0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 1.8, 1.9, 2.0]
+rotations: [0]
+# 读板站专用：把归一化板面匹配映射回原图像素，再作为 /objects 发布。
+# 必须 image_scale=1.0；几何候选来自 2026-11-17 现场帧，交 A 线确认后替换正式读板几何。
+board_geometry: /home/spark/SUAT/spark/data/calibration/field_20261117/board_view_classification_arrival_20261117_v1.json
+board_threshold: 0.55
+board_scales: [0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2]
+depth:
+  validate: true
+  min_m: 0.15
+  max_m: 1.30
+  window_px: 9
+tracking:
+  min_support_frames: 3
+  track_distance_px: 35.0
+  track_timeout_s: 1.5
+  identity_bucket_px: 24
+publish:
+  instance_hz: 5.0
+  status_hz: 1.0
+evidence_dir: ''

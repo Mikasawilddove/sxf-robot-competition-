@@ -21,6 +21,7 @@ import tf2_ros
 from suat_mission.navigation.navigation_map import load_binding,verify_map
 from suat_mission.navigation.navigation_gate import goal_is_free
 from suat_mission.navigation.navigation_profiles import (
+    BOARD_HEADING, BOARD_POSITION,
     CONTROLLER_HZ, configured_global_planner, LOCAL_PLANNER_PLUGIN, PLANNER_NAMESPACE,
     speed_profile,leg_timeout,path_travel_fault,planner_speed_limits,station_approach_pose,
     local_planner_settings, planner_profile_matches, settings_match,
@@ -30,7 +31,7 @@ from suat_mission.navigation.field_routes import validate_route,StaticPlanner
 from suat_mission.navigation.navigation_executor import NavigationExecutor
 from suat_mission.contracts import ActionContext
 from suat_mission.navigation.corner_egress import contact_path,contact_handoffs
-from suat_mission.navigation.pickup_keepout import PLANNING_MAP_TOPIC, PickupKeepout
+from suat_mission.navigation.pickup_keepout import KEEP_OUT_FILE, PLANNING_MAP_TOPIC, PickupKeepout, is_pickup_station
 
 
 def yaw(q):
@@ -39,19 +40,32 @@ def yaw(q):
 
 class NavigationPlanError(ValueError):
     """Keep the rejected planner output available to the normal run recorder."""
+    STATION_ERRORS = frozenset((
+        'goal body footprint is blocked on selected map', 'no complete live plan',
+        'one leg exceeds 8 m', 'pickup endpoint lacks stopping clearance from the brick array',
+        'live planner returned a partial path', 'live path crosses central pickup keepout',
+        'live path body overlaps occupied or unknown saved map cells',
+    ))
+
     def __init__(self, message, plan):
         super().__init__(message)
         self.plan = plan
 
 
 class Navigator:
-    def __init__(self,root,speed,owner=None,health_check=None,planner_mode=None):
+    A_DEPARTURE_LIMIT_S = 25.
+
+    def __init__(self,root,speed,owner=None,health_check=None,planner_mode=None,keepout_file=KEEP_OUT_FILE,
+                 *,comparison=False):
         self.owner=owner or rospy.get_name()
         self.health_check=health_check
         self.planner_mode=planner_mode
-        self.global_planner=configured_global_planner(root, planner_mode) if planner_mode is not None else None
+        self.comparison=comparison
+        self.global_planner=None if planner_mode is None else configured_global_planner(
+            root, 'rollout' if comparison else planner_mode)
         self.binding=load_binding(root);self.speed=speed
-        self.keepout=PickupKeepout.load(root,self.binding) if self.owner=='/suat_mission' else None
+        self.keepout_file=keepout_file
+        self.keepout=PickupKeepout.load(root,self.binding,keepout_file) if self.owner=='/suat_mission' else None
         footprint=rospy.get_param('/move_base/global_costmap/footprint','[]')
         if footprint not in (None,'','[]',[]):raise ValueError('field validator requires a circular footprint')
         self.radius=float(rospy.get_param('/move_base/global_costmap/robot_radius',.20))+float(rospy.get_param('/move_base/global_costmap/footprint_padding',.02))
@@ -96,7 +110,7 @@ class Navigator:
         msg.pose.orientation.z=math.sin(pose[2]/2);msg.pose.orientation.w=math.cos(pose[2]/2)
         return msg
 
-    def plan(self,start,goal,grid):
+    def plan(self,start,goal,grid,*,pickup_approach=False,pickup_station=False):
         evidence={'start_pose':list(start),'goal_pose':list(goal),'frame_id':'map',
                   'body_radius_m':self.radius,'max_leg_length_m':8.,'planning_attempts':[],
                   'planner_policy':'shortest_valid_contact_handoff_fix03'}
@@ -109,7 +123,20 @@ class Navigator:
         if self.keepout is not None and min(self.keepout.distance(start),self.keepout.distance(goal))<=self.radius:
             reject('start or goal body overlaps central pickup keepout')
         start_clear=goal_is_free(grid,*start[:2],radius=self.radius)
-        if not goal_is_free(grid,*goal[:2],radius=max(.25,self.radius)):
+        goal_radius=max(.25,self.radius)
+        if pickup_approach or pickup_station:
+            if self.keepout is None or not self.keepout.precise_pickup:
+                reject('pickup endpoint requires the matching keepout profile')
+            goal_radius=self.radius+.01
+            if self.keepout.distance(goal)<=goal_radius:
+                reject('pickup endpoint lacks stopping clearance from the brick array')
+        if pickup_approach:
+            if not start_clear or math.dist(start[:2],goal[:2])>.101:
+                reject('pickup approach requires a clear start and a correction within 10 cm')
+            if (not StaticPlanner(grid,radius=self.radius).segment_free(start,goal)
+                    or not self.keepout.segment_clear(start,goal,self.radius)):
+                reject('direct pickup approach intersects the floor obstacles or brick clearance')
+        if not goal_is_free(grid,*goal[:2],radius=goal_radius):
             reject('goal body footprint is blocked on selected map')
         checker=StaticPlanner(grid,radius=self.radius)
         def live_points(a,b):
@@ -142,6 +169,8 @@ class Navigator:
                            contact_handoff=handoff)
             if length>8:
                 raise ValueError('one leg exceeds 8 m')
+            if pickup_approach and length>min(.17,math.dist(start[:2],goal[:2])+.05):
+                raise ValueError('pickup alignment requires a short local path')
             if self.keepout is not None and not all(self.keepout.segment_clear(a,b,self.radius)
                                                     for a,b in zip(points,points[1:])):
                 raise ValueError('live path crosses central pickup keepout')
@@ -193,7 +222,8 @@ class Navigator:
                 reject(str(exc))
         plan.update(start_pose=list(start),goal_pose=list(goal),
                     planner_policy=evidence['planner_policy'],
-                    planning_attempts=evidence['planning_attempts'])
+                    planning_attempts=evidence['planning_attempts'],pickup_approach=pickup_approach,
+                    pickup_station=pickup_station)
         return plan
 
     def connect_control(self):
@@ -208,6 +238,8 @@ class Navigator:
                 raise ValueError('navigation output belongs to another owner')
             if self.keepout is not None and self.state.get('mission_keepout') is not True:
                 raise ValueError('mission navigation requires the central pickup keepout')
+            if self.keepout is not None and self.state.get('keepout_file',KEEP_OUT_FILE)!=self.keepout_file:
+                raise ValueError('navigation gate is using a different pickup keepout')
             if self.owner=='/suat_mission' and not {'lease_linear_cap_mps','lease_angular_cap_radps'}<=self.state.keys():
                 raise ValueError('mission navigation requires the per-goal speed gate')
             if (self.state.get('health') is not None or self.state.get('active_goal') is not False
@@ -227,19 +259,23 @@ class Navigator:
                 raise ValueError('global planner mismatch: expected %s, got %s' % (self.global_planner,actual_global))
             if (rospy.get_param('/move_base/base_local_planner',None)!=LOCAL_PLANNER_PLUGIN
                     or rospy.get_param('/move_base/controller_frequency',None)!=CONTROLLER_HZ
-                    or not planner_profile_matches(live,self.planner_mode)):
+                    or not planner_profile_matches(live,self.planner_mode,comparison=self.comparison)):
                 raise ValueError('active ROS navigation does not match the selected local planner profile')
         allowed=[limits]
         # A retained idle mission stack may still be configured for the last
         # approach. The stopped executor sets and verifies the next limits.
-        if self.owner=='/suat_mission':allowed.append(planner_speed_limits('slow'))
+        if self.owner=='/suat_mission':
+            allowed.append(planner_speed_limits('slow'))
+            if self.keepout is not None and self.keepout.precise_pickup:
+                allowed.append(planner_speed_limits('pickup'))
         if not any(settings_match(live,option) for option in allowed):
             raise ValueError('planner limits differ from the selected cruise or approach profile')
         params={'/suat_navigation_smoother/speed_lim_v':profile['linear'],
                 '/suat_navigation_smoother/speed_lim_w':profile['angular']}
         if any(abs(float(rospy.get_param(k,float('nan')))-v)>1e-8 or not math.isfinite(float(rospy.get_param(k,float('nan')))) for k,v in params.items()):
             raise ValueError('planner/smoother limits differ from selected speed')
-        self.nav=actionlib.SimpleActionClient('/move_base',MoveBaseAction)
+        if self.nav is None:
+            self.nav=actionlib.SimpleActionClient('/move_base',MoveBaseAction)
         if not self.nav.wait_for_server(rospy.Duration(3)):raise ValueError('navigation server unavailable')
         self.connected=True
 
@@ -267,7 +303,9 @@ class Navigator:
             report['plan']=response.get('plan')
             started=True;report['motion_command_sent']=True
             io.start_heartbeat(token)
-            deadline=min(io.now()+25.,context.deadline-self.executor_stop_budget()) if context else io.now()+25.
+            deadline = io.now() + self.A_DEPARTURE_LIMIT_S
+            if context is not None:
+                deadline = min(deadline, context.deadline-self.executor_stop_budget())
             while io.now()<deadline and not io.shutdown():
                 if self.health_check:self.health_check()
                 with self.lock:
@@ -313,8 +351,13 @@ class Navigator:
         return NavigationExecutor.STOP_BUDGET
 
     def _execute_station(self,item,plan,context):
+        if self.speed=='slow' and (item['name']=='Classification_area'
+                                   or item['name'].startswith('Classification_area__')):
+            return self._execute_board_station(item,plan,context)
         cruise=None
-        if self.speed!='slow' and plan['path_length_m']>=.65:
+        pickup_station=is_pickup_station(self.keepout,item['name'])
+        finish_speed='pickup' if pickup_station else 'slow'
+        if plan['path_length_m']>=.65:
             approach=station_approach_pose(plan['path_xy'])
             if approach is not None:
                 try:
@@ -328,18 +371,62 @@ class Navigator:
                         return dict(cruise,name=item['name'],goal=list(item['pose']),arrival_confirmed=False,
                                     cruise=cruise)
                     try:
-                        plan=self.plan(self.pose(),item['pose'],self.grid())
+                        plan=self.plan(self.pose(),item['pose'],self.grid(),pickup_station=pickup_station)
                     except NavigationPlanError as exc:
                         return dict(cruise,name=item['name'],goal=list(item['pose']),passed=False,
                                     arrival_confirmed=False,error=str(exc),rejected_plan=exc.plan,cruise=cruise)
-        report=self.executor.execute(item,plan,context=context,xy_tolerance=.04,yaw_tolerance=.07,
-                                     controller_speed='slow')
+        report=self.executor.execute(item,plan,context=context,phase='align',xy_tolerance=.01 if pickup_station else .04,
+                                     yaw_tolerance=.07,controller_speed=finish_speed)
         if cruise is not None:
             report['cruise']=cruise
             report['motion_goal_sent']|=cruise['motion_goal_sent']
         if report.get('actual_pose'):
             report['final_error_m'],report['final_yaw_error_rad']=arrival_error(item['pose'],report['actual_pose'])
         return report
+
+    def _execute_board_station(self,item,plan,context):
+        # Drive to the measured XY before applying the recorded board-facing heading.
+        xy_tolerance,yaw_tolerance=.04,.07
+        position=self.executor.execute(item,plan,phase=BOARD_POSITION,xy_tolerance=xy_tolerance,
+                                       yaw_tolerance=math.pi,context=context,controller_speed='slow')
+        report=dict(position,passed=False,arrival_confirmed=False,position_leg=position)
+        if position['passed']:
+            try:
+                current=self.pose()
+                if math.dist(current[:2],item['pose'][:2])>xy_tolerance:
+                    raise ValueError('board position shifted outside tolerance after stopping')
+                turn_plan=self.plan(current,item['pose'],self.grid())
+            except (ValueError,rospy.ROSException) as exc:
+                report['error']=str(exc)
+            else:
+                report=self.executor.execute(item,turn_plan,phase=BOARD_HEADING,
+                    xy_tolerance=xy_tolerance,yaw_tolerance=yaw_tolerance,context=context,
+                    controller_speed='slow')
+                report['position_leg']=position
+                report['motion_goal_sent']|=position['motion_goal_sent']
+                if report.get('output_released'):
+                    try:
+                        self.executor.transport.configure(xy_tolerance,yaw_tolerance,
+                                                          controller_speed='slow',phase='align')
+                    except Exception as exc:
+                        report.update(passed=False,error='restore planner after board turn: '+str(exc))
+        if report.get('actual_pose'):
+            report['final_error_m'],report['final_yaw_error_rad']=arrival_error(item['pose'],report['actual_pose'])
+        return report
+
+    def can_try_next_station(self, report, context):
+        if (report.get('passed') or not report.get('output_released')
+                or time.monotonic()+self.executor_stop_budget()>=context.deadline
+                or any(report.get(key) for key in ('stop_error','release_error','heartbeat_error'))):
+            return False
+        if report.get('candidate_unreachable'):
+            return True
+        error=report.get('error')
+        if error in ('no navigation progress for 20 seconds','navigation deadline reached'):
+            return True
+        if report.get('action_terminal_state')==4 and report.get('action_terminal_error'):
+            return error==report['action_terminal_error']
+        return not error and report.get('action_terminal_state') in (3,4)
 
     def execute_leg(self,item,plan,cancel_distance=None,context=None,phase='coarse',
                     xy_tolerance=.08,yaw_tolerance=.12,align_path=False,station_approach=False):
@@ -349,6 +436,17 @@ class Navigator:
             raise ValueError('entry alignment and distance cancellation require separate trials')
         prefix_report=None
         grid=self.grid();start=self.pose()
+        pickup_approach=plan.get('pickup_approach',False)
+        if pickup_approach:
+            if phase!='align' or context is None or align_path or station_approach or cancel_distance is not None:
+                raise ValueError('pickup approach requires one bounded alignment leg')
+            timeout=plan['timeout_s']
+            try:
+                plan=self.plan(start,item['pose'],grid,pickup_approach=True)
+            except NavigationPlanError as exc:
+                return {'name':item['name'],'passed':False,'pickup_plan_refused':True,
+                        'motion_goal_sent':False,'error':str(exc),'rejected_plan':exc.plan}
+            plan['timeout_s']=min(plan['timeout_s'],timeout)
         start_clear=goal_is_free(grid,*start[:2],radius=self.radius)
         target=plan.get('contact_handoff')
         # AMCL may move the footprint across a raster edge after make_plan.
@@ -360,7 +458,7 @@ class Navigator:
             except ValueError:
                 replan=True
         if replan:
-            plan=self.plan(start,item['pose'],grid)
+            plan=self.plan(start,item['pose'],grid,pickup_station=plan.get('pickup_station',False))
             target=plan.get('contact_handoff')
         if not start_clear:
             if target is None:
@@ -377,7 +475,38 @@ class Navigator:
                 return dict(prefix_report,name=item['name'],goal=list(item['pose']),
                     motion_goal_sent=prefix_report.get('motion_command_sent',False),
                     arrival_confirmed=False,error='recorded-goal path prefix failed: '+prefix_report.get('error',''),phase=phase)
-            plan=self.plan(self.pose(),item['pose'],self.grid())
+            attempts = []
+            for attempt in range(2):
+                failure = dict(name=item['name'], goal=list(item['pose']), passed=False,
+                               arrival_confirmed=False, phase='post_departure_plan',
+                               initial_contact_prefix=prefix_report, planning_failures=attempts,
+                               motion_goal_sent=prefix_report['motion_command_sent'],
+                               output_released=prefix_report['output_released'], candidate_unreachable=False)
+                try:
+                    if self.health_check:
+                        self.health_check()
+                    if time.monotonic() + self.executor_stop_budget() >= context.deadline:
+                        raise TimeoutError('navigation budget exhausted after departure')
+                    self.connect_control()
+                    plan = self.plan(self.pose(), item['pose'], self.grid(),
+                                     pickup_station=plan.get('pickup_station', False))
+                    if plan.get('contact_handoff') is not None:
+                        raise ValueError('start footprint still overlaps after departure')
+                    remaining = context.deadline - time.monotonic()
+                    if remaining <= self.executor_stop_budget():
+                        raise TimeoutError('navigation budget exhausted after departure replan')
+                    plan['timeout_s'] = min(plan['timeout_s'], remaining)
+                    plan['post_departure_planning_failures'] = attempts
+                    break
+                except NavigationPlanError as exc:
+                    attempts.append(exc.plan)
+                    if attempt == 0 and str(exc) in ('no complete live plan', 'live planner returned a partial path'):
+                        time.sleep(.2)
+                        continue
+                    return dict(failure, error=str(exc), rejected_plan=exc.plan,
+                                candidate_unreachable=str(exc) in NavigationPlanError.STATION_ERRORS)
+                except Exception as exc:
+                    return dict(failure, error=str(exc) or type(exc).__name__)
         if not hasattr(self,'executor'):
             self.executor=NavigationExecutor(RosNavigationTransport(self))
         entry_report=None
@@ -410,7 +539,7 @@ class Navigator:
         if station_approach:
             report=self._execute_station(item,plan,context)
         else:
-            selected='slow' if phase=='align' and self.owner=='/suat_mission' else None
+            selected='pickup' if pickup_approach else ('slow' if phase=='align' and self.owner=='/suat_mission' else None)
             report=self.executor.execute(item,plan,context=context,phase=phase,
                 xy_tolerance=xy_tolerance,yaw_tolerance=yaw_tolerance,cancel_distance=cancel_distance,
                 controller_speed=selected)
@@ -493,7 +622,7 @@ class RosNavigationTransport:
             self.sleep(.05)
         return False
 
-    def configure(self,xy,yaw_tolerance,controller_speed=None):
+    def configure(self,xy,yaw_tolerance,controller_speed=None,phase='coarse'):
         # Dynamic reconfigure is lazy: the offline core never imports ROS libraries.
         from dynamic_reconfigure.client import Client
         client=Client(PLANNER_NAMESPACE,timeout=2.)
@@ -501,10 +630,12 @@ class RosNavigationTransport:
         # parameter topic cache may still contain the preceding leg's values.
         changes={'xy_goal_tolerance':xy,'yaw_goal_tolerance':yaw_tolerance}
         self.controller_speed=controller_speed
-        if controller_speed is not None:changes.update(planner_speed_limits(controller_speed))
+        if controller_speed is not None:
+            changes.update(planner_speed_limits(controller_speed,turn_only=phase==BOARD_HEADING))
         mode=self.navigator.planner_mode
         if mode is not None:
-            changes.update(local_planner_settings(mode,controller_speed=='slow',xy))
+            changes.update(local_planner_settings(mode,phase!='coarse',xy,
+                comparison=self.navigator.comparison,track_front=phase==BOARD_POSITION))
         actual=client.update_configuration(changes)
         if not settings_match(actual,changes):
             raise ValueError('local planner did not confirm the stopped-phase settings')
@@ -513,7 +644,7 @@ class RosNavigationTransport:
     def arm(self):
         key='/suat_navigation_gate/station_approach'
         mission=self.navigator.owner=='/suat_mission'
-        if mission:rospy.set_param(key,self.controller_speed=='slow')
+        if mission:rospy.set_param(key,'pickup' if self.controller_speed=='pickup' else self.controller_speed=='slow')
         try:
             result=self.service('arm')
         finally:
@@ -573,9 +704,11 @@ class RosNavigationTransport:
             state=dict(node.state or {})
             state_age=self.now()-node.state_at
         status=self.terminal if self.terminal is not None else node.nav.get_state()
+        status_text=node.nav.get_goal_status_text() if self.terminal is not None else ''
         return {'generation':self.generation,'status':status,'pose':pose,'odom_pose':odom,
                 'linear':linear,'angular':angular,'age':age,'gate_state':state.get('state'),
-                'gate_age':state_age}
+                'gate_age':state_age,'gate_reason':state.get('reason'),'gate_health':state.get('health'),
+                'status_text':status_text}
 
     def release(self):
         return bool(self.service('release').success)

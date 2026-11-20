@@ -1,6 +1,10 @@
 # Candidate evaluated with final output latched zero. Not field validated.
 # Existing planner plugin, trajectory rollout mode; speed caps unchanged.
+# DWAPlannerROS resets the stop/rotate latch on setPlan. Replan on demand
+# when local control fails instead of replacing the plan during each turn.
+planner_frequency: 0.0
 DWAPlannerROS:
+  latch_xy_goal_tolerance: true
   # Restore the upstream obstacle preference weight; collision rejection and
   # the configured body/inflation geometry remain in the obstacle critic.
   occdist_scale: 0.01

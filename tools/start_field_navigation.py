@@ -16,24 +16,29 @@ from suat_mission.navigation.navigation_profiles import (
     local_planner_settings, speed_profile,
 )
 from suat_mission.navigation.navigation_map import load_binding
-from suat_mission.navigation.pickup_keepout import PickupKeepout
+from suat_mission.navigation.pickup_keepout import KEEP_OUT_FILE, PickupKeepout
 
 
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--speed',choices=('slow','normal','fast'),default='slow')
     parser.add_argument('--planner',choices=PLANNER_MODES,default='rollout')
+    parser.add_argument('--comparison',action='store_true',
+                        help='use the shared sampling and terminal settings for the board-station comparison')
     parser.add_argument('--owner',choices=('field','mission'),default='field',help='one navigation owner for this stack')
+    parser.add_argument('--keepout',default=KEEP_OUT_FILE)
     parser.add_argument('--start',action='store_true')
     parser.add_argument('--describe',action='store_true',help='offline description, no ROS connection')
     args=parser.parse_args();speed=speed_profile(args.speed)
     owner='/suat_mission' if args.owner=='mission' else '/suat_field_navigation'
-    settings=local_planner_settings(args.planner)
-    global_planner=configured_global_planner(ROOT,args.planner)
+    settings=local_planner_settings(args.planner,comparison=args.comparison)
+    use_rollout_settings=args.comparison or args.planner=='rollout'
+    global_planner=configured_global_planner(ROOT,'rollout' if use_rollout_settings else args.planner)
     result={'mode':'field','speed':args.speed,'planner':args.planner,'limits':speed,'field_validated':False,'navigation_owner':owner,
             'global_planner':global_planner,'local_planner':LOCAL_PLANNER_PLUGIN,
             'controller_hz':CONTROLLER_HZ,'cruise_sampling':settings,
-            'approach_sampling':local_planner_settings(args.planner,approach=True),
+            'approach_sampling':local_planner_settings(args.planner,approach=True,comparison=args.comparison),
+            'comparison':args.comparison,
             'output_initially':'DISARMED_NO_CMD_VEL_PUBLISHER','motion_goal_sent':False}
     if args.describe:
         if args.start:parser.error('--describe cannot start nodes')
@@ -53,12 +58,13 @@ def main():
     if not ready:return 2
     if args.start:
         if args.owner=='mission':
-            PickupKeepout.load(ROOT,load_binding(ROOT))
+            PickupKeepout.load(ROOT,load_binding(ROOT),args.keepout)
         return subprocess.call(['roslaunch',str(ROOT/'src/suat_mission/launch/navigation_field.launch'),
             'workspace_root:='+str(ROOT),'speed_profile:='+args.speed,
             'navigation_owner:='+owner,
             'mission_keepout:='+str(args.owner=='mission').lower(),
-            'rollout_candidate:='+str(args.planner=='rollout').lower(),
+            'keepout_file:='+args.keepout,
+            'rollout_candidate:='+str(use_rollout_settings).lower(),
             'planner_mode:='+args.planner,
             'local_planner_settings:='+json.dumps(settings,separators=(',',':')),
             'controller_hz:='+str(CONTROLLER_HZ),

@@ -5,7 +5,7 @@ from suat_mission.navigation.navigation_gate import goal_is_free
 from suat_mission.navigation.map_identity import map_identity, validate_map_identity
 
 
-def validate_route(route, grid):
+def validate_route(route, grid, radius=.25):
     if route.get('schema') != 1 or route.get('frame_id') != 'map':
         raise ValueError('route requires schema 1 and map frame')
     validate_map_identity(route, grid)
@@ -16,7 +16,7 @@ def validate_route(route, grid):
         pose = item.get('pose') if isinstance(item, dict) else None
         if not isinstance(pose, (list, tuple)) or len(pose) != 3 or not all(type(v) in (int,float) and math.isfinite(v) for v in pose):
             raise ValueError('waypoint requires finite [x,y,yaw]')
-        if not goal_is_free(grid, pose[0], pose[1]):
+        if not goal_is_free(grid, pose[0], pose[1], radius=radius):
             raise ValueError('waypoint footprint blocked: '+str(item.get('name')))
     return points
 

@@ -46,6 +46,10 @@ from cv_bridge import CvBridge
 from sensor_msgs.msg import Image
 from swiftpro.msg import position, status
 from suat_mission.manipulation.official_calibration import load_profile, project_top
+from suat_mission.manipulation.arm_path import (
+    FEED_APPROACH, FEED_FAST, FEED_LOADED, speed_of, travel_dwell, vertical_lift_points,
+)
+from suat_mission.vision.experimental_vision import ExperimentalVision, TEMPLATE_FILES, measure_layer
 
 # --- 标定参数：全部从场地标定文件读，源码里不留 DLT 数值 --------------------
 #
@@ -298,13 +302,7 @@ def load_calibration(files=None, use_camera_info=True, verbose=True):
 # 固件不认名义进给率：F10000 标称 167mm/s，实机只有 44mm/s。
 # 实测把 F 提到 80000 能跑到 95mm/s，再往上（150000）反而回落到 80，
 # 说明 80000 就是固件的饱和点。
-FEED_FAST = 80000.0   # 长距离平移、转关节、回初始位
-FEED_SLOW = 40000.0   # 空载接近
-FEED_LOADED = 10000.0  # 驱动原始档位；带载起提和转运的初始调试上限
-
-# F 值 -> 实测速度(mm/s)，用于估算等待时间。
-# 中间线性插值，超过最高档按最高档算。想提速就调 FEED_FAST，不要超过 80000。
-FEED_SPEED_TABLE = [(0.0, 20.0), (10000.0, 44.3), (40000.0, 78.7), (80000.0, 95.4)]
+FEED_SLOW = FEED_APPROACH
 
 # 转关节时末端走的是弧线，实测比直线快：r=200 转 90°（弧长 314mm）
 # 正向 2.46s、反向 2.76s，等效 114~128mm/s。用直线那套 95mm/s 估会多等一秒多。
@@ -317,17 +315,6 @@ DWELL_MIN = 0.45      # 再短的动作也要给这一点
 DWELL_STEP = 1.2      # 分段走时每段的等待（兼容旧调用）
 DWELL_LONG = 1.6
 
-
-def speed_of(feed):
-    """把 F 值折算成实测速度 mm/s（分段线性插值）。"""
-    pts = FEED_SPEED_TABLE
-    if feed <= pts[0][0]:
-        return pts[0][1]
-    for (f1, s1), (f2, s2) in zip(pts, pts[1:]):
-        if feed <= f2:
-            k = (feed - f1) / float(f2 - f1)
-            return s1 + (s2 - s1) * k
-    return pts[-1][1]
 
 # 在观察位和方块正上方之间水平移动时保持的高度，必须高于方块顶面
 SAFE_Z = 70.0
@@ -465,49 +452,6 @@ def rise_map(depth):
     return result.astype(np.float32)
 
 
-def measure_layer(rise, box, layer_rise=100.0, block_h=100.0, tol=0.25):
-    """Conservative single-frame estimate: return (layer, rise), or (None, rise).
-
-    The reference plane and heights must be independently validated.
-    """
-    if rise is None or not isinstance(rise, np.ndarray) or rise.ndim != 2:
-        return None, None
-    if not np.isfinite(layer_rise) or layer_rise <= 0 or not np.isfinite(block_h) or block_h <= 0:
-        return None, None
-    try:
-        x, y, w, h = (int(v) for v in box)
-    except (TypeError, ValueError, OverflowError):
-        return None, None
-    if w <= 0 or h <= 0:
-        return None, None
-    rows, cols = rise.shape
-    x0, x1 = max(0, x), min(cols, x + w)
-    y0, y1 = max(0, y), min(rows, y + h)
-    if x1 - x0 < 8 or y1 - y0 < 8:
-        return None, None
-    width, height = x1 - x0, y1 - y0
-    left, right = x0 + int(width * 0.10), x1 - int(width * 0.10)
-    top = y0 + int(height * 0.05)
-    bottom = y0 + max(int(height * 0.45), int(height * 0.05) + 4)
-    band = rise[top:min(bottom, y1), left:right]
-    finite = band[np.isfinite(band)]
-    if finite.size < max(40, int(np.ceil(band.size * 0.25))):
-        print('[layer] unknown: insufficient valid depth', flush=True)
-        return None, None
-    max_layer = min(2, int(250.0 // block_h))
-    tolerance = min(max(float(tol), 0.0), 0.25) * layer_rise
-    support = [np.abs(finite - (i + 1) * layer_rise) <= tolerance
-               for i in range(max_layer + 1)]
-    counts = [int(np.count_nonzero(mask)) for mask in support]
-    winner = int(np.argmax(counts))
-    competing = max([count for i, count in enumerate(counts) if i != winner] or [0])
-    if (counts[winner] < max(40, int(np.ceil(0.60 * finite.size)))
-            or competing >= 0.20 * finite.size):
-        print('[layer] unknown: weak, inconsistent, or conflicting evidence', flush=True)
-        return None, float(np.median(finite))
-    return winner, float(np.median(finite[support[winner]]))
-
-
 def find_block(colour, depth, min_area=2500):
     """按「比地面凸出多少」分割方块，再用立方体尺寸做几何校验。
 
@@ -571,13 +515,6 @@ def find_block(colour, depth, min_area=2500):
         best['depth'] = int(depth[int(best['v']), int(best['u'])])
     return best, mask
 
-
-TEMPLATE_FILES = {
-    'banana': ['banana.png'],
-    'cake': ['cake.png', 'cake_rule_reference.png'],
-    'clock': ['clock.png'],
-    'teddybear': ['teddybear.png'],
-}
 
 _SMALL_TEMPLATES = None
 
@@ -678,21 +615,10 @@ def named_vision():
     if _VISION is not None:
         return _VISION
     import rospkg
-    from suat_mission.vision.experimental_vision import ExperimentalVision
 
     base = os.path.join(rospkg.RosPack().get_path('suat_mission'),
                         'assets', 'templates')
-    templates = {}
-    for label, files in TEMPLATE_FILES.items():
-        images = []
-        for name in files:
-            path = os.path.join(base, name)
-            image = cv2.imread(path)
-            if image is None or not image.size:
-                raise RuntimeError('模板读取失败: %s' % path)
-            images.append(image)
-        templates[label] = images
-    _VISION = ExperimentalVision(templates, banana_saturation_min=55)
+    _VISION = ExperimentalVision.from_template_directory(base)
     return _VISION
 
 
@@ -721,20 +647,6 @@ def _top_face_uv(box, depth):
     return x0 + float(xs.mean()), y0 + float(ys.mean())
 
 
-def _enhance(image, clip=3.0, scale=2.0):
-    """对比度增强 + 放大。
-
-    白底浅色图案的方块（典型是时钟）角点又少又弱，原图上只能匹配到
-    8~9 个点，单应算出来的四边形会略微塌陷，被凸性检查筛掉。
-    CLAHE 拉一下亮度对比度再放大 2 倍，特征点就够了。
-    """
-    lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
-    l, a, b = cv2.split(lab)
-    l = cv2.createCLAHE(clipLimit=clip, tileGridSize=(8, 8)).apply(l)
-    out = cv2.cvtColor(cv2.merge([l, a, b]), cv2.COLOR_LAB2BGR)
-    return cv2.resize(out, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
-
-
 def find_named_block(colour, depth, target, min_score=0.45, min_hits=1):
     """识别画面里所有方块，挑出名字等于 target 的那一个。
 
@@ -745,25 +657,7 @@ def find_named_block(colour, depth, target, min_score=0.45, min_hits=1):
     min_hits 是「目标至少要找到几个」。要叠同名方块时必须给 2 ——
     只找到一个的话，抓起来桌上就没得放了。数量不够会自动走增强重识别。
     """
-    vision = named_vision()
-    found = [d for d in vision.detect(colour) if d.score >= min_score]
-
-    hits = [d for d in found if d.label == target]
-    if len(hits) < min_hits:
-        # 原图漏检时用增强图重试。时钟是白底浅灰，原图上常常只提得出几个角点，
-        # 一个框都框不全，更别说两个。CLAHE 拉对比度 + 放大 2 倍能补回来。
-        from suat_mission.vision.perception import Detection
-        big = _enhance(colour)
-        scaled = [d for d in vision.detect(big) if d.score >= min_score]
-        if scaled:
-            scaled = [Detection(d.label, d.score, d.x / 2.0, d.y / 2.0,
-                                d.width / 2.0, d.height / 2.0) for d in scaled]
-            new_hits = [d for d in scaled if d.label == target]
-            print('    原图只找到 %d 个 %s，增强后 %d 个'
-                  % (len(hits), target, len(new_hits)), flush=True)
-            if len(new_hits) > len(hits):
-                found = scaled
-                hits = new_hits
+    found = named_vision().detect_for_target(colour, target, min_score, min_hits)
 
     mask = np.zeros(depth.shape, np.uint8)
     for d in found:
@@ -833,7 +727,7 @@ class Arm(object):
         宁可稍长也不要短：等短了会在机械臂还在动的时候就发下一条，
         抓取时会把方块刮歪。
         """
-        return max(DWELL_MIN, dist / max(speed_of(feed), 1.0) + DWELL_PAD)
+        return travel_dwell(dist, feed)
 
     def goto(self, x, y, z, dwell=None, tag='', feed=None):
         if feed is None:
@@ -886,19 +780,10 @@ class Arm(object):
 
     def ascend(self, x, y, z_from, z_to, step=0.0, dwell=None, feed=None):
         """原地抬升：x、y 全程不变，只有 z 在动。step <= 0 时一条指令直达。"""
-        if not (math.isfinite(z_to) and math.isfinite(z_from) and z_to >= z_from):
-            raise ValueError('抬升终点必须高于或等于起点')
-        if z_from == z_to:
-            return
         if feed is None:
             feed = FEED_SLOW
-        if step <= 0:
-            self.goto(x, y, z_to, dwell=dwell, feed=feed)
-            return
-        z = z_from
-        while z < z_to:
-            z = min(z_to, z + step)
-            self.goto(x, y, z, feed=feed)
+        for pose in vertical_lift_points((x, y, z_from), z_to, step):
+            self.goto(*pose, dwell=dwell if step <= 0 else None, feed=feed)
 
     def swing(self, radius, z, deg_from, deg_to, step_deg=10.0, dwell=None,
               feed=None):

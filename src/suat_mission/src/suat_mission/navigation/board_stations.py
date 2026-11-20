@@ -34,6 +34,7 @@ def board_station_candidates(route_pose, binding, records):
             seen.add(pose)
             options.append({'id': name, 'pose': pose, 'view_evidence': evidence})
 
+    add('latest_recording', latest, 'board visible in field notes; live read required')
     previous = metadata.get('previous_station_pose')
     if previous is not None:
         add('recorded_reference', _pose(previous), 'recorded reference board view')
@@ -44,6 +45,5 @@ def board_station_candidates(route_pose, binding, records):
             add('recorded_adjustment_' + str(index), pose, 'recorded observation adjustment; live read required')
     backoff = (x - .05 * math.cos(yaw), y - .05 * math.sin(yaw), yaw)
     add('latest_backoff_5cm', backoff, 'derived from recorded pose; live read required')
-    add('latest_recording', latest, 'board visible in field notes; live read required')
     add('active_route', route, 'configured route view; live read required')
     return tuple(options)

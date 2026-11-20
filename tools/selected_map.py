@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Resolve the single hash/geometry-checked selected map offline."""
+"""Resolve the selected map and any fitted field transform offline."""
 import argparse
 import json
 from pathlib import Path
@@ -18,7 +18,12 @@ def main():
     args=parser.parse_args()
     try:
         binding=load_binding(args.workspace_root)
+        field=binding.get('field_alignment')
         print(binding['map_yaml'] if args.path else json.dumps({'map_file':binding['map_yaml'],
+              'alignment_version':field['alignment_version'] if field else binding['alignment_version'],
+              'field_alignment_file':binding.get('field_alignment_file'),
+              'field_to_map':({k:field[k] for k in ('theta_rad','translation_m','check_rms_m')}
+                              if field else None),
               'map_identity':map_identity(binding),'robot_connected':False},indent=2))
         return 0
     except (ValueError,OSError,KeyError) as exc:

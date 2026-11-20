@@ -5,6 +5,7 @@ from pathlib import Path
 import time
 
 from suat_mission.contracts import ActionResult, Outcome
+from suat_mission.manipulation.arm_path import FEED_APPROACH, FEED_FAST, FEED_LOADED, vertical_lift_points
 from suat_mission.manipulation.pickup_geometry import PickupGeometry, GeometryUnavailable
 from suat_mission.navigation.map_identity import validate_map_identity
 from suat_mission.navigation.navigation_map import load_binding
@@ -65,7 +66,9 @@ def resolve_serial_config(config, root):
         points.update(approaches)
         result['pickup_stations_file'] = str(pickup_file)
     result['waypoints'] = points
-    if result.get('mission_scope') == 'cake-only':
+    if (result.get('mission_scope') == 'cake-only'
+            and not (result.get('navigation_keepout_file')
+                     and geometry.values.get('reachable_top_selection') is True)):
         result['max_base_alignments'] = 0
     if result.get('board_station_records_file'):
         station_file = resource(root, result['board_station_records_file'])
@@ -123,23 +126,30 @@ class SerialMissionRuntime:
         from std_msgs.msg import String
         if self.active_pub is None:
             self.active_pub=rospy.Publisher('/suat/manipulation/active',String,queue_size=1,latch=True)
-        self.active_pub.publish(String(data=json.dumps({
-            'phase':phase,'object_id':getattr(target or self.selected_target,'object_id',self.held or ''),
-            'label':getattr(target or self.selected_target,'label',self.held_label),
+        target=target or self.selected_target
+        payload={
+            'phase':phase,'object_id':getattr(target,'object_id',self.held or ''),
+            'label':getattr(target,'label',self.held_label),
             'calibration_id':self.geometry.calibration_id,'stamp':rospy.Time.now().to_sec(),
             'zone':self.zone,
-            'arm_pose_mm':self.arm_pose,'cup_offset_mm':self.geometry.cup_offset})))
+            'arm_pose_mm':self.arm_pose,'cup_offset_mm':self.geometry.cup_offset}
+        if target is not None and phase in ('approach','align_tool'):
+            surface=target.surface
+            if surface.get('top_polygon_px') and surface.get('image_size'):
+                payload['locked_top']={'polygon_px':surface['top_polygon_px'],
+                                       'image_size':surface['image_size'],
+                                       'top_z_mm':self.geometry.point(target)[2]}
+        self.active_pub.publish(String(data=json.dumps(payload)))
 
     def open(self):
         if self.session is not None:
             return
         from suat_mission.manipulation.arm_session import ArmSession
         self.session=ArmSession(self.run,feed=float(self.config.get('arm_feed_mm_min',1000.)))
-        self.session.fast_feed=float(self.config.get('arm_fast_feed_mm_min',80000.))
-        self.session.contact_feed=float(self.config.get('arm_contact_feed_mm_min',40000.))
+        self.session.fast_feed=float(self.config.get('arm_fast_feed_mm_min',FEED_FAST))
+        self.session.contact_feed=float(self.config.get('arm_contact_feed_mm_min',FEED_APPROACH))
         self.session.correction_feed=float(self.config.get('arm_correction_feed_mm_min',1000.))
-        if self.config.get('mission_scope') == 'cake-only':
-            self.session.loaded_feed_limit = 10000.
+        self.session.loaded_feed_limit = FEED_LOADED
         self.session.permitted=lambda: self._permitted()
         self.session.open()
         self.arm_pose=self.session.read_pose(time.monotonic()+3.)['xyz']
@@ -152,25 +162,49 @@ class SerialMissionRuntime:
         except Exception:
             return False
 
-    def move(self, phase, xyz, deadline, loaded=False):
+    def move(self, phase, xyz, deadline, loaded=False, *, feed_limit=None):
         self.ensure()
         self.geometry.check_pose(xyz)
         self.event(phase,status='moving',target_mm=xyz)
-        measurement=self.session.go(phase,xyz,loaded=loaded,deadline=deadline)
-        self.arm_pose=self.session.read_pose(deadline)['xyz']
+        motion_options = {} if feed_limit is None else {'feed_limit': feed_limit}
+        measurement=self.session.go(phase,xyz,loaded=loaded,deadline=deadline,**motion_options)
+        self.arm_pose=measurement['measurements'][-1]['xyz']
         self.observed_after=time.monotonic()
         self.event(phase, target_mm=xyz, measured_pose_mm=self.arm_pose, measurement=measurement)
         self.active(phase)
 
-    def observation(self, kind, deadline):
+    def prepare_empty_observation(self, unfolded_pose, deadline, *, fold_feed_limit):
+        self.open()
+        self.ensure()
+        if self.held is not None or self.session.pump_may_be_on:
+            raise RuntimeError('workpose recovery requires an empty arm with the pump off')
+        home = self.geometry.check_pose(self.geometry.values['empty_travel_pose_mm'])
+        side = self.geometry.check_pose(self.geometry.values['observation_pose_mm'])
+        tolerance = self.session.correction_tolerance_mm
+        start = self.arm_pose
+        if min(math.dist(start, home), math.dist(start, side)) <= tolerance:
+            return
+
+        # The front fold is below the normal grasp workspace. All motion
+        # targets still pass the existing workspace and controller IK checks.
+        front = self.geometry.bounds[0] if self.geometry.bounds is not None else 0.
+        if 0. < start[0] < front and math.hypot(*start[:2]) < front and start[2] < unfolded_pose[2]:
+            self.move('unfold_empty_arm', unfolded_pose, deadline, feed_limit=fold_feed_limit)
+            self.move('center_workpose', home, deadline)
+        else:
+            self.geometry.check_pose(start)
+            if start[2] < unfolded_pose[2] - tolerance:
+                clearance = [start[0], start[1], unfolded_pose[2]]
+                self.move('raise_empty_arm', clearance, deadline)
+
+    def observation(self, kind, deadline, *, feed_limit=None):
         if self.held is not None:
             raise RuntimeError('cannot use an empty observation pose while carrying')
         key='board_observation_pose_mm' if kind=='board' else 'observation_pose_mm'
         pose=self.geometry.values.get(key,self.geometry.values.get('observation_pose_mm'))
         if pose is None:
             raise GeometryUnavailable('missing observation pose: '+key)
-        self.move('observe_'+kind,list(pose),deadline)
-        self.active('observe_'+kind)
+        self.move('observe_'+kind,list(pose),deadline,feed_limit=feed_limit)
 
     def fresh_scene(self,deadline):
         while time.monotonic()<deadline:
@@ -199,13 +233,19 @@ class SerialMissionRuntime:
             if self.last_scene.manipulation.get('calibration',{}).get('status')!='translation_refined':
                 raise GeometryUnavailable('measured camera/arm reference pairs did not agree')
             self.event('camera_translation_refined',observation=self.last_scene.manipulation['calibration'])
+        else:
+            self.event('camera_calibration_loaded', calibration_id=self.geometry.calibration_id,
+                       source_file=self.geometry.values.get('source_file'))
         self.bootstrapped=True
 
     def reachable_grasp(self,contact,approach,lift,deadline):
         points=[contact,[contact[0],contact[1],contact[2]+approach],
                 [contact[0],contact[1],contact[2]+lift]]
         for point in points:
-            self.geometry.check_pose(point)
+            try:
+                self.geometry.check_pose(point)
+            except GeometryUnavailable:
+                return False
             if not self.session.validate_target(point,deadline):return False
         # Check the actual straight connections, not merely isolated endpoints.
         for a,b in zip(points,points[1:]):
@@ -237,20 +277,28 @@ class SerialMissionRuntime:
         required=self.confirm_frames
         aligned=[]
         corrections=0
+        observations={'rgbd_frames':0,'cup_frames':0,'top_frames':0}
+        tool_evidence={}
+        top_evidence={}
         until=min(deadline,time.monotonic()+8.)
         try:
             while time.monotonic()<until:
                 scene=self.fresh_scene(until)
+                observations['rgbd_frames']+=1
                 current=next((d for d in scene.detections if d.object_id==target.object_id),None)
+                tool_evidence=scene.manipulation.get('tool',{})
+                top_evidence=scene.manipulation.get('target_top') or {}
+                surface=current.surface if current is not None else {}
+                if top_evidence.get('state')=='observed' and top_evidence.get('object_id')==target.object_id:
+                    surface=top_evidence['surface']
                 cup=self.observed_cup(scene)
-                if current is None or cup is None:
-                    aligned.clear()
-                    continue
-                surface=current.surface
                 normal=surface.get('plane_normal_arm')
                 offset=surface.get('plane_offset_arm_mm')
-                if (not normal or len(normal)!=3 or not all(math.isfinite(v) for v in normal)
-                        or normal[2]<=0. or offset is None or not math.isfinite(offset)):
+                top_valid=(normal and len(normal)==3 and all(math.isfinite(v) for v in normal)
+                           and normal[2]>0. and offset is not None and math.isfinite(offset))
+                observations['cup_frames']+=int(cup is not None)
+                observations['top_frames']+=int(bool(top_valid))
+                if not top_valid or cup is None:
                     aligned.clear()
                     continue
                 height_at_lock=(offset-normal[0]*top[0]-normal[1]*top[1])/normal[2]
@@ -274,16 +322,101 @@ class SerialMissionRuntime:
                     raise GeometryUnavailable('visual cup/target error exceeds bounded local correction')
                 scale=min(1.,step/distance)
                 goal=[self.arm_pose[0]+error[0]*scale,self.arm_pose[1]+error[1]*scale,self.arm_pose[2]]
-                self.geometry.check_pose(goal)
+                try:
+                    self.geometry.check_pose(goal)
+                except GeometryUnavailable as exc:
+                    raise BaseAlignmentRequired(error) from exc
                 if not self.session.validate_target(goal,deadline):
                     raise BaseAlignmentRequired(error)
                 self.move('align_tool',goal,deadline)
                 corrections+=1
                 aligned.clear()
                 until=min(deadline,time.monotonic()+8.)
-        except TimeoutError as exc:
-            raise GeometryUnavailable('fresh cup and target depth unavailable before descent') from exc
-        raise GeometryUnavailable('cannot observe a stable cup and target depth before descent')
+        except TimeoutError:
+            pass
+        self.event('pregrasp_depth_timeout',object_id=target.object_id,**observations,
+                   tool=tool_evidence,target_top=top_evidence)
+        raise GeometryUnavailable('pre-descent RGB-D evidence did not converge '
+                                  '(frames={rgbd_frames}, cup={cup_frames}, top={top_frames})'.format(**observations))
+
+    def pregrasp_view_margin(self, contact, approach):
+        if not self.geometry.values.get('require_visual_alignment') or self.last_scene is None:
+            return None
+        view=self.last_scene.manipulation
+        camera=view.get('camera') or {}
+        marker_margin=view.get('tool',{}).get('view_margin_mm')
+        translation=view.get('calibration',{}).get('legacy_camera_B_mm')
+        matrix=self.geometry.values.get('legacy_camera_A')
+        if not camera or marker_margin is None or not translation or not matrix:
+            return None
+        pose=[contact[0],contact[1],contact[2]+approach]
+        x,y,z=[sum(a*b for a,b in zip(row,pose))+offset for row,offset in zip(matrix,translation)]
+        if z<=0.:
+            return -math.inf
+        fx,fy,cx,cy=camera['intrinsics']
+        w,h=camera['image_size']
+        u,v=fx*x/z+cx,fy*y/z+cy
+        return min(u,v,w-1-u,h-1-v)-marker_margin*max(fx,fy)/z
+
+    def select_pickup_pose(self,target,approach,lift,deadline):
+        choices=[]
+        for option in self.geometry.pickup_options(target):
+            try:
+                dx,dy=self.geometry.base_adjustment(option)
+                contact=self.geometry.contact_target(option)
+            except GeometryUnavailable:
+                continue
+            clearance=float(option.surface.get('edge_margin_mm',0.))
+            choices.append((math.hypot(dx,dy),-clearance,option,contact,dx,dy))
+        if not choices:
+            raise GeometryUnavailable('no supported suction point on the observed top')
+        # Minimal or zero base motion first. Try the best-supported point and
+        # a shorter reach early, before spending serial queries on near ties.
+        choices.sort(key=lambda entry:entry[:2])
+        stationary=[entry for entry in choices if entry[0]<=1.]
+        if len(stationary)>1:
+            nearer=min(range(1,len(stationary)),key=lambda i:math.hypot(*stationary[i][3][:2]))
+            stationary.insert(1,stationary.pop(nearer))
+        margins=[self.pregrasp_view_margin(entry[3],approach) for entry in stationary]
+        if margins and margins[0] is not None:
+            order=sorted(range(len(stationary)),key=lambda i:(margins[i]<0,i if margins[i]>=0 else -margins[i]))
+            stationary=[stationary[i] for i in order]
+        for _,_,option,contact,dx,dy in stationary[:5]:
+            if self.reachable_grasp(contact,approach,lift,deadline):
+                margin=self.pregrasp_view_margin(contact,approach)
+                if margin is not None:
+                    self.event('pregrasp_view_selected',object_id=option.object_id,
+                               predicted_tool_margin_px=margin if math.isfinite(margin) else None)
+                return option, ()
+        return None, choices
+
+    def pickup_corrections(self, choices, approach, lift, deadline):
+        limit=float(self.config.get('max_base_adjustment_mm',100.))
+        offsets=[]
+        for distance,_,_,contact,dx,dy in choices:
+            if distance<=1.:
+                continue
+            if self.config.get('navigation_keepout_file'):
+                margin=1000.*float(self.config.get('base_alignment_tolerance_m',.01))
+                dx=dx+math.copysign(margin,dx) if abs(dx)>1. else 0.
+                dy=dy+math.copysign(margin,dy) if abs(dy)>1. else 0.
+            if 1.<math.hypot(dx,dy)<=limit:
+                offsets.append((dx,dy,contact))
+        # Some top points lie within the rectangle but fail the full arm path.
+        if choices[0][0]<=1.:
+            contact=choices[0][3]
+            offsets.extend((x,y,contact) for x in range(-100,101,25) for y in range(-75,76,25)
+                           if 0<math.hypot(x,y)<=min(limit,100.))
+        tried=set()
+        for dx,dy,contact in sorted(offsets,key=lambda item:math.hypot(*item[:2])):
+            offset=(round(dx,1),round(dy,1))
+            if offset in tried:
+                continue
+            if time.monotonic()>=deadline:
+                return
+            if self.reachable_grasp([contact[0]-dx,contact[1]-dy,contact[2]],approach,lift,deadline):
+                tried.add(offset)
+                yield dx,dy
 
     def fresh_target(self, object_id, deadline):
         while time.monotonic()<deadline:
@@ -377,7 +510,7 @@ class SerialMissionRuntime:
                 return target,point
         raise TimeoutError('fresh visual manipulation evidence did not converge')
 
-    def pick(self, target, label, context, _alignment_round=0):
+    def pick(self, target, label, context, _alignment_round=0, *, return_to_support=False):
         self.open();self.ensure()
         self.version=max(self.version,context.scene_version)
         self.selected_target=target
@@ -393,30 +526,38 @@ class SerialMissionRuntime:
                     return ActionResult(context,Outcome.UNKNOWN,'selected physical object changed class')
                 if target.graspable is not True or target.occluded_by:
                     raise GeometryUnavailable('fresh target is occluded or lacks a graspable surface')
-                dx,dy=self.geometry.base_adjustment(target)
-                candidate=self.geometry.contact(target)
-                if math.hypot(dx,dy)<=1. and self.reachable_grasp(candidate,approach,lift,context.deadline):
+                selected,choices=self.select_pickup_pose(
+                    target,approach,lift,context.deadline)
+                if selected is not None:
+                    target=selected
                     break
                 if index>=remaining_adjustments:
                     raise GeometryUnavailable('no reachable grasp from the stopped pickup station')
-                if math.hypot(dx,dy)<=1.:
-                    choices=sorted(((x,y) for x in (-100.,-75.,-50.,-25.,0.,25.,50.,75.,100.)
-                        for y in (-75.,-50.,-25.,0.,25.,50.,75.) if 0<math.hypot(x,y)<=100.),key=lambda p:math.hypot(*p))
-                    choice=next(((x,y) for x,y in choices if self.reachable_grasp(
-                        [candidate[0]-x,candidate[1]-y,candidate[2]],approach,lift,context.deadline)),None)
-                    if choice is None:raise GeometryUnavailable('no controller-reachable approach/contact/lift after a local base adjustment')
-                    dx,dy=choice
-                if math.hypot(dx,dy)>float(self.config.get('max_base_adjustment_mm',100.)):
-                    raise GeometryUnavailable('target remains outside the reliable work area')
-                report=self.align_base(dx,dy,context,_alignment_round)
-                _alignment_round+=1
-                self.event('base_align',report=report)
-                if not report['passed']:
-                    return ActionResult(context,Outcome.FAILED,'base alignment failed: '+json.dumps(report))
-                self.observed_after=time.monotonic()
+                refusal='no controller-reachable local base adjustment for the observed top'
+                stowed=False
+                for dx,dy in self.pickup_corrections(choices,approach,lift,context.deadline):
+                    if not stowed:
+                        self.move('empty_travel',self.geometry.values['empty_travel_pose_mm'],context.deadline)
+                        stowed=True
+                    report=self.align_base(dx,dy,context,_alignment_round)
+                    self.event('base_align',report=report,requested_offset_mm=[dx,dy])
+                    if report['passed']:
+                        _alignment_round+=1
+                        break
+                    if not report.get('pickup_plan_refused') or report.get('motion_goal_sent'):
+                        return ActionResult(context,Outcome.FAILED,'base alignment failed: '+json.dumps(report))
+                    refusal=report['error']
+                else:
+                    if stowed:
+                        self.observation('objects',context.deadline)
+                    raise GeometryUnavailable(refusal)
+                self.observation('objects',context.deadline)
                 target=self.fresh_target(target.object_id,context.deadline)
             contact=self.geometry.contact(target)
-            top_before=self.geometry.point(target)
+            # Holding evidence tracks the physical target, independent of the
+            # particular suction point selected for contact.
+            original_target=self.observed_target(self.last_scene,target.object_id,label)
+            top_before=self.geometry.point(original_target or target)
             _,projection=self.geometry.grasp_projection(target)
             self.event('grasp_projection',object_id=target.object_id,contact_command_mm=contact,
                        **projection)
@@ -424,8 +565,22 @@ class SerialMissionRuntime:
             return self.unreachable_pick(context,exc)
         approach=float(self.geometry.values.get('approach_offset_mm',40.))
         lift=float(self.geometry.values.get('lift_offset_mm',50.))
+        measured_lift=(self.session.loaded_feed_limit is not None
+                       or self.geometry.values.get('reachable_top_selection') is True)
+        if measured_lift and (not math.isfinite(lift) or lift<=self.session.correction_tolerance_mm):
+            return self.unreachable_pick(context,'lift must exceed the arm arrival tolerance')
+        self.selected_target=target
         self.active('pick',target)
-        self.move('approach',[contact[0],contact[1],contact[2]+approach],context.deadline)
+        hover_z=contact[2]+approach
+        side=self.geometry.values.get('observation_pose_mm')
+        tolerance=self.session.correction_tolerance_mm
+        if side and math.dist(self.arm_pose,side)<=tolerance and abs(self.arm_pose[1])>tolerance:
+            # Return from the side observation at the same radius and height,
+            # then approach the block horizontally with a clear suction lip.
+            self.move('pregrasp_return_front',[math.hypot(*self.arm_pose[:2]),0.,self.arm_pose[2]],context.deadline)
+            if abs(self.arm_pose[2]-hover_z)>tolerance:
+                self.move('pregrasp_clearance',[*self.arm_pose[:2],hover_z],context.deadline)
+        self.move('approach',[contact[0],contact[1],hover_z],context.deadline)
         if self.geometry.values.get('require_visual_alignment',False):
             try:
                 contact=self.align_tool(target,context.deadline)
@@ -438,32 +593,40 @@ class SerialMissionRuntime:
                     return self.unreachable_pick(context,exc)
                 report=self.align_base(exc.error[0],exc.error[1],context,_alignment_round)
                 self.event('visual_base_align',report=report,measured_error_mm=exc.error)
+                if report.get('pickup_plan_refused'):
+                    self.observation('objects',context.deadline)
+                    return self.unreachable_pick(context,report['error'])
                 if not report['passed']:return ActionResult(context,Outcome.FAILED,'visual base adjustment failed: '+json.dumps(report))
                 self.observation('objects',context.deadline)
-                return self.pick(target,label,context,_alignment_round+1)
+                return self.pick(target,label,context,_alignment_round+1,return_to_support=return_to_support)
             except GeometryUnavailable as exc:
+                self.event('visual_alignment_rejected', object_id=target.object_id, error=str(exc))
                 self.observation('objects',context.deadline)
                 return self.unreachable_pick(context,exc)
         self.move('contact',contact,context.deadline)
         lift_from = contact
-        if self.session.loaded_feed_limit is not None:
+        if measured_lift:
             # Anchor the vertical command to the measured contact pose. The cup
             # may have settled a few mm from the requested contact coordinates.
             lift_from = self.arm_pose
-            if not math.isfinite(lift) or lift <= self.session.correction_tolerance_mm:
-                raise GeometryUnavailable('lift must exceed the arm arrival tolerance')
             for fraction in (.25, .5, .75, 1.):
                 sample = [lift_from[0], lift_from[1], lift_from[2] + fraction * lift]
-                self.geometry.check_pose(sample)
-                if not self.session.validate_target(sample, context.deadline):
-                    raise GeometryUnavailable('vertical lift from measured contact is outside controller reach')
-        lift_target = [lift_from[0], lift_from[1], lift_from[2]+lift]
+                try:
+                    self.geometry.check_pose(sample)
+                    valid=self.session.validate_target(sample, context.deadline)
+                except GeometryUnavailable:
+                    valid=False
+                if not valid:
+                    return ActionResult(context,Outcome.FAILED,
+                                        'pump is off; lift from measured contact is outside controller reach')
+        lift_target, = vertical_lift_points(lift_from, lift_from[2]+lift)
         self.session.pump(True,deadline=context.deadline)
         self.held=target.object_id  # possible holding until image evidence settles it
         self.held_label=label
         self.move('lift',lift_target,context.deadline,loaded=True)
-        if self.geometry.values.get('hold_observation_pose_mm'):
-            self.move('hold_view',self.geometry.values['hold_observation_pose_mm'],context.deadline,loaded=True)
+        hold_pose = self.geometry.values.get('hold_observation_pose_mm')
+        if hold_pose:
+            self.move('hold_view',hold_pose,context.deadline,loaded=True)
         try:
             held,point=self._confirm_pick(target,top_before,lift,min(context.deadline,
                 time.monotonic()+float(self.config.get('feedback_timeout',15.))))
@@ -475,6 +638,20 @@ class SerialMissionRuntime:
             self.observation('objects',context.deadline)
             return ActionResult(context,Outcome.NOT_ACQUIRED,'selected target stayed on support; gripper volume visibly empty')
         self.last_hold_seen=time.monotonic()
+        if return_to_support:
+            self.event('holding_confirmed',object_id=target.object_id,observed_top_mm=point)
+            if hold_pose:
+                self.move('static_return_above',lift_target,context.deadline,loaded=True)
+            self.move('static_return_contact',lift_from,context.deadline,loaded=True)
+            self.session.pump(False,deadline=context.deadline)
+            self.move('verify_placement',lift_target,context.deadline)
+            self._wait_target(target.object_id,context.deadline,lambda d,p:
+                math.dist(p,top_before)<=float(self.geometry.values.get('holding_position_tolerance_mm',25.))
+                and self.observed_empty_for(self.last_scene,target.object_id),stable_mm=5.)
+            self.event('returned_to_support',object_id=target.object_id)
+            self.held=None;self.held_label=''
+            self.observation('objects',context.deadline)
+            return ActionResult(context,Outcome.CONFIRMED,'measured lift, visual hold and return to original support confirmed')
         self.move('transport',self.geometry.values['transport_pose_mm'],context.deadline,loaded=True)
         self.active('carrying',target)
         self._wait_target(target.object_id,min(context.deadline,time.monotonic()+
@@ -588,42 +765,149 @@ class SerialMissionRuntime:
         import rospy
         from cv_bridge import CvBridge
         from sensor_msgs.msg import Image
-        from suat_mission.vision.board_recognition import BoardGeometry, BoardReader, DirectionEvidence
+        from suat_mission.vision.board_recognition import BoardDecision, BoardReader, DirectionEvidence
+        from suat_mission.vision.board_station_view import observe_zone_markers, station_views
+        from suat_mission.vision.mission_overlay import MissionOverlay, draw_board
         from suat_mission.vision.template_matcher import TemplateMatcher
-        geometry_file = self.config['board_geometry_file']
-        if station == 'Classification_area__recorded_reference':
-            geometry_file = self.config.get('board_reference_geometry_file', geometry_file)
-        data=json.loads(Path(geometry_file).read_text(encoding='utf-8'))
-        geometry=BoardGeometry(tuple(data['image_size']),data['corners'],tuple(data['normalized_size']),data['geometry_id'])
-        direction=DirectionEvidence(run_id,geometry.geometry_id,'fixed_reference',data['direction_reference'],
-                                    tuple(data['zones']),data.get('direction_confirmed') is True)
-        reader=BoardReader(run_id,geometry,direction,started_ns=rospy.Time.now().to_nsec(),
-            min_votes=int(self.config.get('board_votes',3)),threshold=float(self.config.get('board_min_confidence',.6)))
-        templates={n:[cv2.imread(str(self.root/'src/suat_mission/assets/templates'/(n+'.png')))]
-                   for n in ('clock','teddybear','banana')}
-        matcher=TemplateMatcher(templates,scales=[.4,.5,.6,.7,.8,.9,1.,1.1,1.2],threshold=.6,max_peaks=8)
-        images_dir = self.run/'board'/station
-        images_dir.mkdir(parents=True, exist_ok=True)
-        bridge=CvBridge();last=reader.started_ns;rows=[]
-        deadline=min(time.monotonic()+float(self.config.get('board_timeout',20.)),
-                     float(self.config.get('_deadline',float('inf'))))
-        while len(rows)<int(self.config.get('board_frames',5)) and time.monotonic()<deadline:
-            self.ensure()
-            msg=rospy.wait_for_message(self.config.get('board_image_topic','/camera/color/image_raw'),Image,timeout=3)
-            stamp=msg.header.stamp.to_nsec()
-            if stamp<=last:continue
-            last=stamp;image=bridge.imgmsg_to_cv2(msg,'bgr8')
-            matches=matcher.detect_board(geometry.normalize(image));detections=matches.pop('detections')
-            image_file=images_dir/('frame_%02d.png'%len(rows))
-            name=str(image_file.relative_to(self.run))
-            if not cv2.imwrite(str(image_file),image):raise RuntimeError('cannot save board image')
-            decision=reader.observe(detections,coordinate_space='normalized_board',run_id=run_id,
-                stamp_ns=stamp,now_ns=rospy.Time.now().to_nsec(),frame_id=msg.header.frame_id,image_id=name)
-            rows.append({'stamp_ns':stamp,'image':name,'accepted':decision.accepted})
-        result=reader.result(now_ns=rospy.Time.now().to_nsec())
-        self.event('board_result',station=station,geometry_file=geometry_file,
-                   accepted=result.accepted,reason=result.reason,mapping=dict(result.mapping),frames=rows)
-        return result
+
+        geometry_file, data, views = station_views(self.config, station)
+        start = rospy.Time.now().to_nsec()
+        deadline = min(time.monotonic() + float(self.config.get('board_timeout', 20.)),
+                       float(self.config.get('_deadline', float('inf'))))
+        topic = self.config.get('board_image_topic', '/camera/color/image_raw')
+        bridge = CvBridge()
+        overlay = MissionOverlay('board', bridge, draw_board)
+        directory = self.run / 'board' / station
+        directory.mkdir(parents=True, exist_ok=True)
+        evidence = dict(run_id=run_id, station=station, geometry_file=str(geometry_file),
+                        view_ids=[v.geometry_id for v in views], frames=[])
+        overlay_frame = None
+        direction_caption = 'Waiting for direction evidence'
+
+        def finish(accepted, reason, mapping, details=None):
+            if details:
+                evidence.update(details)
+            if overlay_frame is not None:
+                frame, rgb, view, codes, detections, slots = overlay_frame
+                status = ('confirmed' if accepted else 'rejected') + ' | ' + reason
+                overlay.render(frame, rgb, view, codes, detections, slots, status, mapping,
+                               direction_caption, save=directory / 'mission_overlay.png')
+            self.event('board_result', accepted=accepted, reason=reason, mapping=mapping, **evidence)
+            return BoardDecision(accepted, reason, mapping, evidence)
+
+        last = start
+        def next_image():
+            nonlocal last
+            while time.monotonic() < deadline:
+                self.ensure()
+                try:
+                    msg = rospy.wait_for_message(topic, Image, timeout=min(3., max(.01, deadline-time.monotonic())))
+                except rospy.ROSException:
+                    if rospy.is_shutdown():
+                        raise
+                    continue
+                stamp = msg.header.stamp.to_nsec()
+                if stamp <= last or not 0 <= rospy.Time.now().to_nsec()-stamp <= 2000000000:
+                    continue
+                if not msg.header.frame_id:
+                    continue
+                last = stamp
+                return msg, bridge.imgmsg_to_cv2(msg, 'bgr8')
+            return None
+
+        probe = next_image()
+        if probe is None:
+            return finish(False, 'no_fresh_board_image', {})
+        marker_msg, image = probe
+        overlay_frame = (marker_msg, image, None, (), (), ())
+        if tuple(image.shape[1::-1]) != views[0].image_size:
+            return finish(False, 'station_camera_size_mismatch', {})
+        marker_file = directory / 'zone_markers.png'
+        if not cv2.imwrite(str(marker_file), image):
+            raise RuntimeError('cannot save station marker image')
+        try:
+            markers = observe_zone_markers(self.root, image)
+        except cv2.error as exc:
+            markers = []
+            evidence['zone_marker_error'] = str(exc)
+        observed = tuple(m['zone'] for m in markers)
+        expected = tuple(data['zones'])
+        source = 'fixed_reference'
+        reference = data['direction_reference']
+        confirmed = data.get('direction_confirmed') is True
+        zones = expected
+        overlay_frame = (marker_msg, image, views[0], markers, (), expected)
+        marker_status = ', '.join('%s/%s' % (m['zone'] or '?', m['source']) for m in markers) or 'none'
+        direction_caption = 'Markers: ' + marker_status
+        overlay.render(*overlay_frame, 'checking direction', {}, direction_caption,
+                       save=directory / 'zone_markers_overlay.png')
+        evidence['zone_markers'] = dict(image=str(marker_file.relative_to(self.run)), observations=markers,
+                                       frame_id=marker_msg.header.frame_id, stamp_ns=last)
+        if len(observed) == 3:
+            if confirmed and any(z is not None and z != expected[i] for i, z in enumerate(observed)):
+                return finish(False, 'station_markers_conflict_with_slot_order', {})
+            if all(observed):
+                if set(observed) != {'B','C','D'}:
+                    return finish(False, 'duplicate_station_marker_zones', {})
+                source, reference, confirmed, zones = 'station_zone_markers', str(marker_file), True, observed
+        evidence['direction_source'] = source
+        direction_caption = 'Direction: ' + source + ' | markers: ' + marker_status
+        if not confirmed:
+            return finish(False, 'unconfirmed_station_direction', {})
+
+        readers = []
+        for view in views:
+            direction = DirectionEvidence(run_id, view.geometry_id, source, reference, zones, confirmed,
+                                          stamp_ns=last if source == 'station_zone_markers' else None,
+                                          observation_frame=marker_msg.header.frame_id)
+            readers.append(BoardReader(run_id, view, direction, started_ns=start,
+                min_votes=int(self.config.get('board_votes', 3)),
+                threshold=float(self.config.get('board_min_confidence', .6))))
+        templates = {label: [cv2.imread(str(self.root/'src/suat_mission/assets/templates'/(label+'.png')))]
+                     for label in ('clock', 'teddybear', 'banana')}
+        matcher = TemplateMatcher(templates, scales=[.4,.5,.6,.7,.8,.9,1.,1.1,1.2], threshold=.6, max_peaks=8)
+        for index in range(int(self.config.get('board_frames', 8))):
+            sample = next_image()
+            if sample is None:
+                break
+            msg, image = sample
+            if msg.header.frame_id != marker_msg.header.frame_id or tuple(image.shape[1::-1]) != views[0].image_size:
+                return finish(False, 'station_camera_changed', {})
+            image_file = directory / ('frame_%02d.png' % index)
+            if not cv2.imwrite(str(image_file), image):
+                raise RuntimeError('cannot save board image')
+            name = str(image_file.relative_to(self.run))
+            row = dict(image=name, stamp_ns=last, views={})
+            frame_candidates = []
+            for reader in readers:
+                matches = matcher.detect_board(reader.geometry.normalize(image))
+                decision = reader.observe(matches['detections'], coordinate_space='normalized_board', run_id=run_id,
+                    stamp_ns=last, now_ns=rospy.Time.now().to_nsec(), frame_id=msg.header.frame_id, image_id=name)
+                row['views'][reader.geometry.geometry_id] = decision.reason
+                frame_candidates.append((reader, matches['detections'], decision))
+            evidence['frames'].append(row)
+            now = rospy.Time.now().to_nsec()
+            results = [reader.result(now_ns=now) for reader in readers]
+            best = max(range(len(readers)), key=lambda i: (results[i].accepted, frame_candidates[i][2].accepted))
+            reader, detections, frame_decision = frame_candidates[best]
+            overlay_frame = (msg, image, reader.geometry, (), detections, zones)
+            status = '%s | %s | %d/%d votes' % (
+                reader.geometry.geometry_id, frame_decision.reason,
+                len(results[best].evidence['support_frames']), reader.min_votes)
+            overlay.render(*overlay_frame, status, frame_decision.mapping, direction_caption)
+            mappings = {tuple(sorted(vote['mapping'].items())) for result in results
+                        for vote in result.evidence['votes']}
+            if len(mappings) > 1:
+                return finish(False, 'conflicting_station_view_votes', {})
+            for (reader, detections, _), result in zip(frame_candidates, results):
+                if result.accepted and time.monotonic() < deadline:
+                    self.ensure()
+                    overlay_frame = (msg, image, reader.geometry, (), detections, zones)
+                    return finish(True, result.reason, dict(result.mapping),
+                                  dict(selected_geometry_id=reader.geometry.geometry_id,
+                                       geometry=result.evidence['geometry'], votes=result.evidence['votes'],
+                                       support_frames=result.evidence['support_frames']))
+        return finish(False, 'insufficient_station_view_votes', {})
 
     def close(self):
         if self.active_pub is not None:

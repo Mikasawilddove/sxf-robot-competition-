@@ -22,6 +22,7 @@ import xmlrpc.client
 
 import rospy
 from suat_mission.manipulation.arm_feedback import SwiftProParser
+from suat_mission.manipulation.arm_path import travel_dwell
 from suat_mission.manipulation.arm_recovery import matched_reply_or_fault, recover_pose
 from suat_mission.contracts import ActionContext
 
@@ -75,6 +76,8 @@ class ArmSession:
         self.loaded_feed_limit = None
         self.correction_feed=min(feed,1000.)
         self.correction_tolerance_mm=5.
+        self.use_recovery_feed = False
+        self.recovering_pose = False
         self.port = None
         self.paused = False
         self.pump_may_be_on = False
@@ -98,16 +101,21 @@ class ArmSession:
         self.records.append({'time': at, 'received_base64': base64.b64encode(data).decode()})
         return self.parser.feed(data, at)
 
-    def ask(self, command, timeout=2.):
+    def ask(self, command, timeout=2., *, numbered=True):
         with self.io_lock:
-            return self._ask(command,timeout)
+            return self._ask(command,timeout,numbered)
 
-    def _ask(self, command, timeout):
-        if (self.permitted is not None and command.startswith(('G0 ', 'M2231 V1'))
+    def _ask(self, command, timeout, numbered):
+        if (self.permitted is not None and command.startswith(('G0 ', 'M2231 V1', 'M17'))
                 and not self.permitted()):
             raise RuntimeError('competition action was stopped before arm command')
-        self.sequence += 1
-        sequence = self.sequence
+        if numbered:
+            self.sequence += 1
+            sequence = self.sequence
+            wire = '#%d %s' % (sequence, command)
+        else:
+            sequence = None
+            wire = command
         at = self.now()
         deadline = at + timeout
         if self.active_deadline is not None and command != 'M2000':
@@ -115,7 +123,7 @@ class ArmSession:
         if at >= deadline:
             raise TimeoutError('arm action deadline reached')
         self.records.append({'time': at, 'sequence': sequence, 'command': command})
-        self.handle.write(('#%d %s\r\n' % (sequence, command)).encode('ascii'))
+        self.handle.write((wire + '\r\n').encode('ascii'))
         while self.now() < deadline:
             frame = matched_reply_or_fault(self._receive(), sequence, at)
             if frame is not None:
@@ -171,6 +179,10 @@ class ArmSession:
         self.pump_may_be_on = False
         if self.values(self.ask('M2200'), 'V') != [0.]:
             raise RuntimeError('arm already moving')
+        # Opening the Arduino resets its controller. Match the factory driver's
+        # initialization before reading the pose or submitting the first G0.
+        self.ask('M2120 V0')
+        self.ask('M17')
         self.records.append({'time': self.now(), 'event': 'CONTINUOUS_SESSION_OPEN'})
 
     def validate_target(self, xyz, deadline):
@@ -191,29 +203,30 @@ class ArmSession:
         if self.values(self.ask('M2200'), 'V') != [0.]:
             raise RuntimeError('arm moving before a new command')
         start = self.read_pose(deadline)['xyz']
-        self.ask('M2000')
         started = self.now()
-        self.ask('G0 X%.4f Y%.4f Z%.4f F%.0f' % (*xyz, self.feed), timeout=30)
-        # Firmware idle can precede physical settling; avoid interrupting a move
-        # merely because three rapid M2200 queries returned idle.
-        table=((1000.,20.),(10000.,44.3),(40000.,78.7),(80000.,95.4))
-        speed=table[-1][1]
-        if self.feed<=table[0][0]:speed=table[0][1]
+        if self.recovering_pose:
+            self.ask('M2000')
+            self.ask('G0 X%.4f Y%.4f Z%.4f F%.0f' % (*xyz, self.feed), timeout=30)
         else:
-            for (f0,s0),(f1,s1) in zip(table,table[1:]):
-                if self.feed<=f1:
-                    speed=s0+(s1-s0)*(self.feed-f0)/(f1-f0);break
-        # Use the measured feed table, not F/60: this firmware saturates.
-        earliest_settled = started + max(.45,math.dist(start,xyz)/speed+.55)
+            # The teammate's ROS writer sends this exact Cartesian wire format.
+            self.ask('G0 X%.2f Y%.2f Z%.2f F%.0f' % (*xyz, self.feed), timeout=30, numbered=False)
+        earliest_settled = started + travel_dwell(math.dist(start,xyz), self.feed)
+        if not self.recovering_pose:
+            # Let the controller execute the continuous G0 before querying joint/FK state.
+            while self.now() < min(deadline, earliest_settled):
+                if self.permitted is not None and not self.permitted():
+                    raise RuntimeError('competition action was stopped during arm travel')
+                time.sleep(.05)
         idle_count = 0
         previous = None
         while self.now() < deadline:
-            measured = self.read_pose(deadline)['xyz']
+            feedback = self.read_pose(deadline)
+            measured = feedback['xyz']
             moving = self.values(self.ask('M2200'), 'V')[0]
             stable = previous is not None and math.dist(measured, previous) < 1.
             idle_count = idle_count + 1 if moving == 0 and stable and self.now() >= earliest_settled else 0
             if idle_count >= 3:
-                return
+                return feedback
             previous = measured
             time.sleep(.1)
         raise TimeoutError('arm did not settle before deadline')
@@ -224,33 +237,53 @@ class ArmSession:
         idle = self.values(self.ask('M2200'), 'V') == [0.]
         return {'acknowledged': frame.kind == 'reply', 'controller_idle': idle, 'stop_sequence': frame.sequence}
 
-    def go(self, stage, xyz, *, loaded=False, deadline=None):
+    def go(self, stage, xyz, *, loaded=False, deadline=None, feed_limit=None):
         end=min(self.now()+75., deadline) if deadline is not None else self.now()+75.
         ctx = ActionContext(self.run.name, stage, 'arm_pose', '', 0, end)
         self.feed=self.contact_feed if stage in ('contact','lift','release_height') else self.fast_feed
-        limit = self.loaded_feed_limit if loaded or self.pump_may_be_on else None
-        if limit is not None:
-            self.feed = min(self.feed, limit)
-        travel_feed = self.feed
-        if stage == 'lift' and limit is not None:
-            # One G0 with fresh joint/FK checks, including after stop. Do not
-            # chase an offset by moving the cup sideways or starting a second lift.
-            result = recover_pose(self, xyz, ctx, tolerance_mm=self.correction_tolerance_mm,
-                                  max_moves=1, stop_budget_s=3.)
-        else:
-            if not self.validate_target(xyz,end):raise RuntimeError(stage+': controller IK rejected target')
-            initial=self.read_pose(end)['xyz']
-            if math.dist(initial,xyz)>self.correction_tolerance_mm:
-                self.move(xyz,end-3.)
-            self.feed = self.correction_feed if limit is None else min(self.correction_feed, limit)
-            result = recover_pose(self, xyz, ctx, tolerance_mm=self.correction_tolerance_mm, max_moves=3,
-                                  stop_budget_s=3., max_correction_step_mm=5. if loaded else 10.,
-                                  max_command_offset_mm=10. if loaded else 25.)
-        self.active_deadline = None
+        loaded_limit = self.loaded_feed_limit if loaded or self.pump_may_be_on else None
+        limits = [limit for limit in (loaded_limit, feed_limit) if limit is not None]
+        self.feed = min([self.feed] + limits)
+        requested_feed = self.feed
+        self.recovering_pose = stage == 'unfold_empty_arm' or self.use_recovery_feed
+        try:
+            fast_result = None
+            if not self.recovering_pose:
+                result = recover_pose(self, xyz, ctx, tolerance_mm=self.correction_tolerance_mm,
+                                      max_moves=1, stop_budget_s=3., stop_after_success=False)
+                stop = result.get('stop', {})
+                measurements = result['measurements']
+                if (result.get('error') == 'bounded recovery exhausted before measured target convergence'
+                        and stop.get('acknowledged') is True and stop.get('controller_idle') is True
+                        and len(measurements) >= 2
+                        and math.dist(measurements[0]['xyz'], measurements[-1]['xyz']) < 1.):
+                    fast_result = result
+                    self.use_recovery_feed = self.recovering_pose = True
+            if self.recovering_pose:
+                self.feed = min(self.feed, self.correction_feed, 1000.)
+                # Feedback compensation is for empty repositioning only. A
+                # descent, a loaded move or a possible hold sends one endpoint.
+                compensate = not (loaded or self.pump_may_be_on or stage == 'contact')
+                recovery = {'max_correction_step_mm': 10., 'max_command_offset_mm': 25.} if compensate else {}
+                if fast_result is not None:
+                    self.records.append({'event': 'FEED_FALLBACK', 'stage': stage,
+                                         'requested_feed': requested_feed, 'retry_feed': self.feed,
+                                         'settled_xyz_mm': fast_result['measurements'][-1]['xyz']})
+                result = recover_pose(self, xyz, ctx, tolerance_mm=self.correction_tolerance_mm,
+                                      max_moves=4 if compensate else 1, stop_budget_s=3., **recovery)
+                if fast_result is not None:
+                    result['initial_travel'] = fast_result
+        finally:
+            self.recovering_pose = False
+            self.active_deadline = None
         self.records.append({'event': 'POSE_RESULT', 'stage': stage, 'loaded': loaded,
-                             'travel_feed_mm_min': travel_feed, 'result': result})
+                             'requested_feed_mm_min': requested_feed,
+                             'travel_feed_mm_min': self.feed, 'result': result})
         if result['outcome'] != 'measured_target_reached':
-            raise RuntimeError(stage + ': ' + result.get('error', 'measured pose did not reach target'))
+            error = result.get('error', 'measured pose did not reach target')
+            if result.get('final_error_mm') is not None:
+                error += ' (measured error %.1f mm)' % result['final_error_mm']
+            raise RuntimeError(stage + ': ' + error)
         return result
 
     def pump(self, on, *, deadline=None):

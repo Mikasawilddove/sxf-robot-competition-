@@ -1,0 +1,65 @@
+<launch>
+  <!-- RGB-D 抓取入口。默认 dry-run：只算目标、不驱动机械臂与吸泵。 -->
+  <!-- execute 置 true 前必须完成：外参或平面标定、工作空间实测、吸盘到位反馈。 -->
+  <arg name="execute" default="false"/>
+  <arg name="extrinsics_file" default=""/>
+  <arg name="calibration_file" default=""/>
+  <arg name="grasp_z_mm" default="-50.0"/>
+  <arg name="support_z_mm" default="nan"/>
+  <arg name="grasp_z_offset_mm" default="0.0"/>
+
+  <node pkg="suat_mission" type="arm_vision_grasp.py" name="arm_vision_grasp" output="screen">
+    <param name="execute" value="$(arg execute)"/>
+    <!-- 运动前强制 M17 上力：read_node 发过 M2019 后电机是松的，G0 会被静默丢弃 -->
+    <param name="attach_motor" value="true"/>
+    <param name="attach_settle_s" value="0.6"/>
+    <param name="extrinsics_file" value="$(arg extrinsics_file)"/>
+    <param name="calibration_file" value="$(arg calibration_file)"/>
+    <param name="grasp_z_mm" value="$(arg grasp_z_mm)"/>
+    <param name="grasp_z_offset_mm" value="$(arg grasp_z_offset_mm)"/>
+
+    <!-- 比赛方块为 10cm 立方体：抓取高度 = 支撑面高度 + 方块高度。
+         support_z_mm 是方块所在支撑面在臂坐标系里的高度，实测后填；
+         留空则退回上面的 grasp_z_mm 单点高度。 -->
+    <param name="block_height_mm" value="100.0"/>
+    <param name="support_z_mm" value="$(arg support_z_mm)"/>
+    <param name="reach_margin_mm" value="10.0"/>
+    <param name="reach_front_only" value="true"/>
+
+    <param name="color_topic" value="/camera/color/image_raw"/>
+    <param name="depth_topic" value="/camera/aligned_depth_to_color/image_raw"/>
+    <param name="camera_info_topic" value="/camera/color/camera_info"/>
+    <param name="objects_topic" value="/objects"/>
+    <param name="marker_frame" value="base_link"/>
+
+    <!-- 列表参数必须用 rosparam，写在 value 里会退化成字符串 -->
+    <rosparam param="target_labels">[teddybear, clock, banana, cake]</rosparam>
+    <param name="min_quality" value="0.35"/>
+    <param name="frame_slack_s" value="0.5"/>
+
+    <param name="min_depth_mm" value="120.0"/>
+    <param name="max_depth_mm" value="700.0"/>
+    <param name="bbox_shrink" value="0.15"/>
+    <param name="cluster_tolerance_mm" value="12.0"/>
+    <param name="min_valid_pixels" value="60"/>
+    <param name="max_spread_mm" value="40.0"/>
+    <param name="max_residual_mm" value="6.0"/>
+    <param name="max_gradient_mm_px" value="0.8"/>
+
+    <param name="x_min" value="40.0"/>
+    <param name="x_max" value="280.0"/>
+    <param name="y_min" value="-180.0"/>
+    <param name="y_max" value="180.0"/>
+    <param name="z_min" value="-80.0"/>
+    <param name="z_max" value="200.0"/>
+
+    <param name="safe_z_mm" value="150.0"/>
+    <param name="approach_mm" value="60.0"/>
+    <param name="lift_mm" value="80.0"/>
+    <param name="lateral_step_mm" value="15.0"/>
+    <param name="vertical_step_mm" value="6.0"/>
+    <param name="lateral_speed_mm_s" value="60.0"/>
+    <param name="vertical_speed_mm_s" value="25.0"/>
+    <rosparam param="arm_start_pose">[50.0, 180.0, 160.0]</rosparam>
+  </node>
+</launch>

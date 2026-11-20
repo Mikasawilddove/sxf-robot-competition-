@@ -48,7 +48,9 @@ NavfnROS:
 GlobalPlanner:
   allow_unknown: false
   use_dijkstra: true
-  use_grid_path: true
+  # GridPath failed to extract a route from the recorded near-board pose.
+  # GradientPath passed the same start/goal and footprint checks on the robot.
+  use_grid_path: false
 global_costmap:
   global_frame: map
   robot_base_frame: base_footprint
