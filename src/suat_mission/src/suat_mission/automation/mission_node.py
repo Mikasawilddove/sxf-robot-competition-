@@ -480,17 +480,23 @@ class RosRobot:
 
     def _navigate(self, name, remaining):
         from suat_mission.navigation.pickup_keepout import is_pickup_station
+        from suat_mission.navigation.navigation_budget import NavigationBudget
+        started = time.monotonic()
+        budget = NavigationBudget(self.nav_timeout)
         self._ensure_running()
         navigator = self._get_navigator()
         item = {'name': name, 'pose': list(self.points[name])}
         candidate = (name == 'Classification_area' or name in getattr(self, 'board_candidates', {})
                      or name in self.scope.sorting_points)
         def make_plan(previous_attempts=None):
+            actual_pose = None
             try:
-                return navigator.plan(navigator.pose(), item['pose'], navigator.grid(),
+                actual_pose = navigator.pose()
+                return navigator.plan(actual_pose, item['pose'], navigator.grid(),
                                       pickup_station=is_pickup_station(navigator.keepout,name))
             except NavigationPlanError as exc:
-                report={'passed':False,'phase':'planning','target':item,
+                report={'passed':False,'phase':'planning','target':item,'first_failure_stage':'planning',
+                        'actual_pose':actual_pose,'leg_elapsed_s':time.monotonic()-started,
                         'error':str(exc),'rejected_plan':exc.plan,
                         'motion_goal_sent':False,'output_lease_opened':False}
                 if previous_attempts:
@@ -512,7 +518,7 @@ class RosRobot:
             self._ensure_running()
             self.nav_active = True
         try:
-            report = navigator.execute_leg(item, plan, context=self.active_context,station_approach=True)
+            report = navigator.execute_leg(item, plan, context=self.active_context,station_approach=True,budget=budget)
             attempts=[report]
             # Only an idle, released navigation failure may replan once. A stop,
             # stale sensor, ownership fault or uncertain payload never retries.
@@ -531,9 +537,13 @@ class RosRobot:
                     else:
                         plan['timeout_s']=min(plan['timeout_s'],self.nav_timeout,
                                               self.active_context.deadline-time.monotonic())
-                        report=navigator.execute_leg(item,plan,context=self.active_context,station_approach=True)
+                        report=navigator.execute_leg(item,plan,context=self.active_context,station_approach=True,
+                                                     budget=budget)
                     attempts.append(dict(report))
                     report['attempts']=attempts
+            report['action_elapsed_s'] = time.monotonic()-started
+            if attempts[0].get('first_failure_stage'):
+                report['first_failure_stage']=attempts[0]['first_failure_stage']
             self.last_navigation_result = report
             sink = getattr(self, 'navigation_evidence_sink', None)
             if sink is not None:
@@ -1068,6 +1078,7 @@ class Node:
                                 target_thresholds=config.get('target_thresholds', {}),
                                 target_roi=config.get('target_roi') or None, each_count=int(config.get('each_count', 3)),
                                 action_timeout=float(config.get('action_timeout', 60)),
+                                navigation_timeout=float(config.get('navigation_timeout', 60)),
                                 observation_max_age=float(config.get('observation_max_age', 2)),
                                 deadline_seconds=self.gate.deadline - self.gate.started_at,
                                 max_pick_retries=int(config.get('max_pick_retries',1)),

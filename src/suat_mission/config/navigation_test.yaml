@@ -1,5 +1,7 @@
 # Candidate for the first unloaded field test; not a validated competition speed.
 controller_frequency: 10.0
+# Phase timeouts are resolved above move_base in NavigationBudget.
+# These plugin patience limits describe local planner recovery behavior.
 controller_patience: 3.0
 planner_frequency: 1.0
 planner_patience: 3.0

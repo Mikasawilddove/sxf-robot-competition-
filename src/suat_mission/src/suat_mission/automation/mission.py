@@ -9,6 +9,7 @@ from suat_mission.vision.perception import OBJECTS, select_target, vote_board
 from suat_mission.contracts import ActionLedger, Outcome
 from suat_mission.automation.world import ObjectState, WorldModel
 from suat_mission.automation.scope import select_scope
+from suat_mission.navigation.navigation_budget import NavigationBudget
 
 
 class MissionError(RuntimeError):
@@ -35,6 +36,7 @@ class MissionConfig:
     each_count: int = 3
     deadline_seconds: float = 600.0
     action_timeout: float = 60.0
+    navigation_timeout: float = 60.0
     observation_max_age: float = 2.0
     mission_scope: str = 'full'
     max_pick_retries: int = 1
@@ -78,9 +80,16 @@ class Mission:
         self.attempts = {}
         self.retry_after_station = None
 
-    def _action(self, action, function, *args, object_id=''):
+    def _action(self, action, function, *args, object_id='', navigation_deadline=None):
         self._check()
-        context = self.ledger.begin(action, min(self.end_time, self.clock() + self.config.action_timeout),
+        now = self.clock()
+        deadline = (NavigationBudget(self.config.navigation_timeout).deadline(now,self.end_time)
+                    if action == 'navigate' else min(self.end_time,now+self.config.action_timeout))
+        if navigation_deadline is not None:
+            deadline = min(deadline,navigation_deadline)
+        if deadline <= now:
+            raise MissionError('navigation budget exhausted before another station')
+        context = self.ledger.begin(action, deadline,
                                     object_id, self.world.version)
         result = function(*args, context=context)
         # Stop/deadline is checked before accepting even a correctly correlated result.
@@ -102,11 +111,11 @@ class Mission:
         if self.clock() >= self.end_time:
             raise MissionError("competition deadline reached")
 
-    def _nav(self, name, *, object_id=''):
+    def _nav(self, name, *, object_id='', navigation_deadline=None):
         self._check()
         self._event("navigate:" + name)
         self._action('navigate', self.robot.navigate, name, max(0.0, self.end_time - self.clock()),
-                     object_id=object_id)
+                     object_id=object_id,navigation_deadline=navigation_deadline)
         self._check()
 
     def _read_board(self):
@@ -114,10 +123,11 @@ class Mission:
         stations = station_selector() if callable(station_selector) else ('Classification_area',)
         reader = getattr(self.robot, 'read_board_mapping', None)
         attempts = []
+        navigation_deadline = NavigationBudget(self.config.navigation_timeout).deadline(self.clock(),self.end_time)
         for station in stations:
             self.report.phase = 'navigate_to_board'
             try:
-                self._nav(station)
+                self._nav(station,navigation_deadline=navigation_deadline)
             except ActionFailure as exc:
                 if exc.result.outcome != Outcome.UNREACHABLE:
                     raise

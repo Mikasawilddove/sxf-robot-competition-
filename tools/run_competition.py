@@ -148,15 +148,16 @@ def missing_base_command(nodes, topics):
     return ['roslaunch','spark_base','spark_base.launch','serialport:='+device]
 
 
-def navigate_to_board(root, configuration, keepout_file, logs, planner, station_id=None):
+def navigate_to_board(root, configuration, keepout_file, logs, planner, station_id=None, *, entered_at):
     """Run the normal navigation leg without starting the mission node."""
     from suat_mission.contracts import ActionContext
     from suat_mission.navigation.board_stations import board_station_candidates
-    from suat_mission.navigation.map_identity import validate_map_identity
-    from suat_mission.navigation.navigation_gate import goal_is_free
+    from suat_mission.navigation.navigation_budget import NavigationBudget
     from suat_mission.navigation.navigation_ros import NavigationPlanError, Navigator
+    from suat_mission.navigation.stations import mission_stations
 
     nav = None
+    started = time.monotonic()
     outcome = {'passed': False, 'run_id': logs.name, 'scope': 'to-board',
                'speed': 'slow', 'planner': planner, 'requested_station': station_id,
                'station_attempts': []}
@@ -164,9 +165,7 @@ def navigate_to_board(root, configuration, keepout_file, logs, planner, station_
         nav = Navigator(root, 'slow', owner='/suat_mission', planner_mode=planner,
                         keepout_file=keepout_file, comparison=True)
         nav.connect_control()
-        route = json.loads((root / configuration['recorded_route_file']).read_text(encoding='utf-8'))
-        validate_map_identity(route, nav.binding)
-        station = next(p['pose'] for p in route['waypoints'] if p['name'] == 'Classification_area')
+        station = mission_stations(root,configuration,nav.binding)['Classification_area']['pose']
         if configuration.get('board_station_records_file'):
             records = json.loads((root / configuration['board_station_records_file']).read_text(encoding='utf-8'))
             candidates = board_station_candidates(station, nav.binding, records)
@@ -176,41 +175,41 @@ def navigate_to_board(root, configuration, keepout_file, logs, planner, station_
             candidates = tuple(item for item in candidates if item['id'] == station_id)
             if not candidates:
                 raise ValueError('board station not present in this map: ' + station_id)
-        follow_budget = float(configuration.get('navigation_timeout', 60.))
-        departure_budget = 0.
-        deadline = time.monotonic() + follow_budget
+        budget = NavigationBudget(float(configuration.get('navigation_timeout', 60.)))
+        competition_deadline = (entered_at + float(configuration.get('mission_timeout', 600.))
+                                - float(configuration.get('startup_delay', 0.))
+                                - float(configuration.get('stop_margin', 0.)))
+        deadline = budget.deadline(started, competition_deadline)
+        outcome.update(budget_s=vars(budget), competition_deadline=competition_deadline,
+                       navigation_deadline=deadline)
         for candidate in candidates:
             if time.monotonic() + nav.executor_stop_budget() >= deadline:
                 raise TimeoutError('navigation budget exhausted before the next board station')
-            grid = nav.grid()
+            planned_at = time.monotonic()
             name = 'Classification_area__' + candidate['id']
             pose = list(candidate['pose'])
             attempt = dict(candidate)
             outcome['station_attempts'].append(attempt)
-            if not goal_is_free(grid, *pose[:2], radius=max(.25, nav.radius)):
-                attempt['error'] = 'goal body footprint is blocked on selected map'
-                continue
             start = nav.pose()
+            outcome['actual_pose'] = start
             try:
-                plan = nav.plan(start, pose, grid)
+                plan = nav.plan(start, pose, nav.grid())
             except NavigationPlanError as exc:
-                attempt.update(error=str(exc), rejected_plan=exc.plan)
+                attempt.update(error=str(exc), rejected_plan=exc.plan, first_failure_stage='planning',
+                               elapsed_s=time.monotonic()-planned_at, actual_pose=start)
+                outcome.setdefault('first_failure_stage','planning')
                 if str(exc) not in NavigationPlanError.STATION_ERRORS:
                     raise
                 continue
             outcome.update(station=name, start_pose=start, goal_pose=pose)
-            # The departure and its stopped handoff must fit beside the
-            # ordinary leg. Candidate changes still share one deadline.
-            if plan.get('contact_handoff') is not None and not departure_budget:
-                departure_budget = nav.A_DEPARTURE_LIMIT_S + nav.executor_stop_budget()
-                deadline += departure_budget
-            outcome.update(follow_budget_s=follow_budget, departure_budget_s=departure_budget)
-            plan['timeout_s'] = min(plan['timeout_s'], deadline-time.monotonic())
             context = ActionContext(logs.name, name, 'navigate', '', 0, deadline)
             print('Navigating to ' + name, flush=True)
             result = nav.execute_leg({'name': name, 'pose': pose}, plan,
-                                     context=context, station_approach=True)
+                                     context=context, station_approach=True, budget=budget)
             outcome.update(passed=result['passed'], navigation=result)
+            outcome['actual_pose'] = result.get('actual_pose', start)
+            if not result['passed']:
+                outcome.setdefault('first_failure_stage',result.get('first_failure_stage','navigation'))
             attempt['navigation'] = result
             if not outcome['passed'] and nav.can_try_next_station(result, context):
                 nav.connect_control()
@@ -223,7 +222,30 @@ def navigate_to_board(root, configuration, keepout_file, logs, planner, station_
                                 or 'no classification station had a clear route from Start_A')
     except (Exception, KeyboardInterrupt) as exc:
         outcome['error'] = str(exc) or type(exc).__name__
+        outcome.setdefault('first_failure_stage','navigation_prepare')
     finally:
+        outcome['elapsed_s'] = time.monotonic()-started
+        outcome.setdefault('actual_pose',None)
+        phases = []
+        for attempt in outcome['station_attempts']:
+            leg = attempt.get('navigation')
+            if not leg:
+                continue
+            if leg.get('initial_contact_prefix'):
+                phases.append(leg['initial_contact_prefix'])
+            if leg.get('position_leg') and leg['phase'] != leg['position_leg']['phase']:
+                phases.append(leg['position_leg'])
+            phases.append(leg)
+        outcome['comparison_metrics'] = {
+            'elapsed_s': outcome['elapsed_s'],
+            'planned_distance_m': sum((phase.get('plan') or {}).get('path_length_m',0.) for phase in phases),
+            'odom_distance_m': sum(phase.get('travel_m',phase.get('distance_m',0.)) or 0. for phase in phases),
+            'timeouts': sum(bool(phase.get('timed_out','deadline' in (phase.get('error') or ''))) for phase in phases),
+            'odom_turn_reversals': sum(phase.get('odom_turn_reversals',0) for phase in phases),
+            'max_observed_cmd_vel_gap_s': max(
+                (phase['output_max_gap_s'] for phase in phases if phase.get('output_max_gap_s') is not None),default=None),
+            'output_messages': sum(phase.get('output_messages',0) for phase in phases),
+        }
         try:
             if nav is not None:
                 nav.close()
@@ -444,7 +466,8 @@ def main():
         raise RuntimeError('navigation did not become ready; global planner expected=%s actual=%s; '
                            'gate=%s; see %s' % (expected_global,actual,json.dumps(nav),logs))
     if args.to_board:
-        return navigate_to_board(root,configuration,keepout_file,logs,args.planner,args.board_station)
+        return navigate_to_board(root,configuration,keepout_file,logs,args.planner,args.board_station,
+                                 entered_at=entered_at)
     old_scene='/suat_mission_scene'
     if old_scene in rosnode.get_node_names():rosnode.kill_nodes([old_scene]);rospy.sleep(.3)
     mission_command=['roslaunch','suat_mission','mission.launch','navigation_speed:='+args.speed,

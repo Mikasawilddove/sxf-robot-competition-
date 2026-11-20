@@ -10,6 +10,7 @@ from suat_mission.manipulation.pickup_geometry import PickupGeometry, GeometryUn
 from suat_mission.navigation.map_identity import validate_map_identity
 from suat_mission.navigation.navigation_map import load_binding
 from suat_mission.navigation.board_stations import board_station_candidates
+from suat_mission.navigation.stations import mission_stations
 
 
 class BaseAlignmentRequired(GeometryUnavailable):
@@ -36,35 +37,10 @@ def resolve_serial_config(config, root):
     validate_map_identity(route,binding)
     result['recorded_route_file']=str(filename)
     result['waypoint_map_identity']=route['map_identity']
-    points = {p['name']:p['pose'] for p in route['waypoints']}
-    for name,pose in result.get('waypoints',{}).items():
-        if name in points and points[name]!=pose:
-            raise ValueError('mission config conflicts with recorded station: '+name)
-        points[name]=pose
-    bcd = result.get('additional_waypoints_file')
-    if bcd and resource(root,bcd).exists():
-        data=json.loads(resource(root,bcd).read_text(encoding='utf-8'))
-        validate_map_identity(data,binding)
-        additions=data.get('waypoints',data)
-        if isinstance(additions,list): additions={p['name']:p['pose'] for p in additions}
-        for name,pose in additions.items():
-            if name in points and points[name]!=pose:
-                raise ValueError('additional waypoints conflict with recorded station: '+name)
-            points[name]=pose
+    stations = mission_stations(root, result, binding)
+    points = {name: entry['pose'] for name, entry in stations.items()}
     if result.get('pickup_stations_file'):
-        pickup_file = resource(root, result['pickup_stations_file'])
-        pickup = json.loads(pickup_file.read_text(encoding='utf-8'))
-        validate_map_identity(pickup, binding)
-        approaches = pickup.get('waypoints', {})
-        if (pickup.get('frame_id') != 'map' or not isinstance(approaches, dict)
-                or set(approaches) != {'Sorting_W', 'Sorting_S', 'Sorting_E', 'Sorting_N'}):
-            raise ValueError('four map-frame pickup approaches required in ' + str(pickup_file))
-        for name, pose in approaches.items():
-            if (not isinstance(pose, list) or len(pose) != 3
-                    or not all(type(v) in (int, float) and math.isfinite(v) for v in pose)):
-                raise ValueError('invalid pickup approach: ' + name)
-        points.update(approaches)
-        result['pickup_stations_file'] = str(pickup_file)
+        result['pickup_stations_file'] = str(resource(root,result['pickup_stations_file']))
     result['waypoints'] = points
     if (result.get('mission_scope') == 'cake-only'
             and not (result.get('navigation_keepout_file')

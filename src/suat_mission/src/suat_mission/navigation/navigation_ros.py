@@ -19,7 +19,8 @@ from std_srvs.srv import Trigger
 import tf2_ros
 
 from suat_mission.navigation.navigation_map import load_binding,verify_map
-from suat_mission.navigation.navigation_gate import goal_is_free
+from suat_mission.navigation.navigation_gate import goal_check_radius, goal_is_free
+from suat_mission.navigation.navigation_budget import NavigationBudget
 from suat_mission.navigation.navigation_profiles import (
     BOARD_HEADING, BOARD_POSITION,
     CONTROLLER_HZ, configured_global_planner, LOCAL_PLANNER_PLUGIN, PLANNER_NAMESPACE,
@@ -53,10 +54,12 @@ class NavigationPlanError(ValueError):
 
 
 class Navigator:
-    A_DEPARTURE_LIMIT_S = 25.
+    A_DEPARTURE_LIMIT_S = NavigationBudget().departure
 
     def __init__(self,root,speed,owner=None,health_check=None,planner_mode=None,keepout_file=KEEP_OUT_FILE,
                  *,comparison=False):
+        from geometry_msgs.msg import Twist
+
         self.owner=owner or rospy.get_name()
         self.health_check=health_check
         self.planner_mode=planner_mode
@@ -72,12 +75,27 @@ class Navigator:
         if not math.isfinite(self.radius) or self.radius<=0:raise ValueError('invalid configured body radius')
         self.buffer=tf2_ros.Buffer();self.listener=tf2_ros.TransformListener(self.buffer)
         self.lock=threading.RLock();self.odom=None;self.state=None;self.state_at=0.
+        self.output_stats=None
         self.subs=[rospy.Subscriber('/odom',Odometry,self.on_odom,queue_size=1),
+                   rospy.Subscriber('/cmd_vel',Twist,self.on_output,queue_size=20),
                    rospy.Subscriber('/suat/navigation/state',String,self.on_state,queue_size=1)]
         self.nav=None
 
     def on_odom(self,msg):
         with self.lock:self.odom=(time.monotonic(),msg)
+
+    def on_output(self,msg):
+        now=time.monotonic()
+        with self.lock:
+            if self.output_stats is not None:
+                count,last,gap=self.output_stats
+                self.output_stats=(count+1,now,max(gap,now-last))
+
+    def last_pose(self):
+        try:
+            return self.pose()
+        except (ValueError,rospy.ROSException,tf2_ros.TransformException):
+            return None
 
     def on_state(self,msg):
         try:
@@ -123,11 +141,11 @@ class Navigator:
         if self.keepout is not None and min(self.keepout.distance(start),self.keepout.distance(goal))<=self.radius:
             reject('start or goal body overlaps central pickup keepout')
         start_clear=goal_is_free(grid,*start[:2],radius=self.radius)
-        goal_radius=max(.25,self.radius)
+        goal_radius=goal_check_radius(self.radius)
         if pickup_approach or pickup_station:
             if self.keepout is None or not self.keepout.precise_pickup:
                 reject('pickup endpoint requires the matching keepout profile')
-            goal_radius=self.radius+.01
+            goal_radius=goal_check_radius(self.radius,precise_pickup=True)
             if self.keepout.distance(goal)<=goal_radius:
                 reject('pickup endpoint lacks stopping clearance from the brick array')
         if pickup_approach:
@@ -284,15 +302,19 @@ class Navigator:
         io=RosNavigationTransport(self)
         report={'passed':False,'motion_command_sent':False,'output_released':False}
         started=prepared=False
+        at=io.now()
+        end=context.deadline if context is not None else at+self.A_DEPARTURE_LIMIT_S+self.executor_stop_budget()
         try:
-            if context and io.now()+self.executor_stop_budget()>=context.deadline:
+            if io.now()+self.executor_stop_budget()>=end:
                 raise ValueError('insufficient original leg budget for contact recovery')
             io.ready()
-            if not io.stop() or not io.settle(io.now()+self.executor_stop_budget()) or not io.release():
+            if not io.stop() or not io.settle(min(end,io.now()+self.executor_stop_budget())) or not io.release():
                 raise ValueError('departure output handoff is not stopped and released')
             prepared=True;io.prepare_heartbeat()
             rospy.wait_for_service('/suat_navigation_gate/begin_a_egress',timeout=3)
             for attempt in range(3):
+                if io.now()+self.executor_stop_budget()>=end:
+                    raise ValueError('departure deadline reached before the gate request')
                 result=io.service('begin_a_egress')
                 if result.success:break
                 if attempt==2 or result.message!='激光检测到起步扫掠范围有障碍':break
@@ -339,21 +361,22 @@ class Navigator:
                 except Exception as exc:report['heartbeat_error']=str(exc)
             if started:
                 try:
-                    report['output_released']=bool(io.settle(io.now()+5.) and io.release())
+                    report['output_released']=bool(io.settle(min(end,io.now()+self.executor_stop_budget())) and io.release())
                 except Exception as exc:
                     report['cleanup_error']=str(exc)
                 report['passed']=bool(report['passed'] and report.get('stop_requested')
                                       and report['output_released'] and not report.get('heartbeat_error'))
+        report.update(elapsed_s=io.now()-at,actual_pose=self.last_pose())
         return report
 
     @staticmethod
     def executor_stop_budget():
         return NavigationExecutor.STOP_BUDGET
 
-    def _execute_station(self,item,plan,context):
+    def _execute_station(self,item,plan,context,budget):
         if self.speed=='slow' and (item['name']=='Classification_area'
                                    or item['name'].startswith('Classification_area__')):
-            return self._execute_board_station(item,plan,context)
+            return self._execute_board_station(item,plan,context,budget)
         cruise=None
         pickup_station=is_pickup_station(self.keepout,item['name'])
         finish_speed='pickup' if pickup_station else 'slow'
@@ -366,16 +389,19 @@ class Navigator:
                     cruise_plan=None  # The original leg can still be followed slowly.
                 if cruise_plan is not None:
                     entry={'name':item['name']+'__approach','pose':approach}
-                    cruise=self.executor.execute(entry,cruise_plan,context=context,controller_speed=self.speed)
+                    cruise=self.executor.execute(entry,cruise_plan,
+                        context=budget.stage(context,'cruise',time.monotonic()),controller_speed=self.speed)
                     if not cruise['passed']:
                         return dict(cruise,name=item['name'],goal=list(item['pose']),arrival_confirmed=False,
-                                    cruise=cruise)
+                                    cruise=cruise,first_failure_stage=cruise['failure_stage'])
                     try:
                         plan=self.plan(self.pose(),item['pose'],self.grid(),pickup_station=pickup_station)
                     except NavigationPlanError as exc:
                         return dict(cruise,name=item['name'],goal=list(item['pose']),passed=False,
-                                    arrival_confirmed=False,error=str(exc),rejected_plan=exc.plan,cruise=cruise)
-        report=self.executor.execute(item,plan,context=context,phase='align',xy_tolerance=.01 if pickup_station else .04,
+                                    arrival_confirmed=False,error=str(exc),rejected_plan=exc.plan,cruise=cruise,
+                                    first_failure_stage='final_approach_plan')
+        report=self.executor.execute(item,plan,context=budget.stage(context,'align',time.monotonic()),
+                                     phase='align',xy_tolerance=.01 if pickup_station else .04,
                                      yaw_tolerance=.07,controller_speed=finish_speed)
         if cruise is not None:
             report['cruise']=cruise
@@ -384,11 +410,12 @@ class Navigator:
             report['final_error_m'],report['final_yaw_error_rad']=arrival_error(item['pose'],report['actual_pose'])
         return report
 
-    def _execute_board_station(self,item,plan,context):
+    def _execute_board_station(self,item,plan,context,budget):
         # Drive to the measured XY before applying the recorded board-facing heading.
         xy_tolerance,yaw_tolerance=.04,.07
         position=self.executor.execute(item,plan,phase=BOARD_POSITION,xy_tolerance=xy_tolerance,
-                                       yaw_tolerance=math.pi,context=context,controller_speed='slow')
+                                       yaw_tolerance=math.pi,
+                                       context=budget.stage(context,'cruise',time.monotonic()),controller_speed='slow')
         report=dict(position,passed=False,arrival_confirmed=False,position_leg=position)
         if position['passed']:
             try:
@@ -397,10 +424,11 @@ class Navigator:
                     raise ValueError('board position shifted outside tolerance after stopping')
                 turn_plan=self.plan(current,item['pose'],self.grid())
             except (ValueError,rospy.ROSException) as exc:
-                report['error']=str(exc)
+                report.update(error=str(exc),first_failure_stage='board_heading_plan')
             else:
                 report=self.executor.execute(item,turn_plan,phase=BOARD_HEADING,
-                    xy_tolerance=xy_tolerance,yaw_tolerance=yaw_tolerance,context=context,
+                    xy_tolerance=xy_tolerance,yaw_tolerance=yaw_tolerance,
+                    context=budget.stage(context,'align',time.monotonic()),
                     controller_speed='slow')
                 report['position_leg']=position
                 report['motion_goal_sent']|=position['motion_goal_sent']
@@ -409,7 +437,8 @@ class Navigator:
                         self.executor.transport.configure(xy_tolerance,yaw_tolerance,
                                                           controller_speed='slow',phase='align')
                     except Exception as exc:
-                        report.update(passed=False,error='restore planner after board turn: '+str(exc))
+                        report.update(passed=False,error='restore planner after board turn: '+str(exc),
+                                      first_failure_stage='restore_planner')
         if report.get('actual_pose'):
             report['final_error_m'],report['final_yaw_error_rad']=arrival_error(item['pose'],report['actual_pose'])
         return report
@@ -429,11 +458,14 @@ class Navigator:
         return not error and report.get('action_terminal_state') in (3,4)
 
     def execute_leg(self,item,plan,cancel_distance=None,context=None,phase='coarse',
-                    xy_tolerance=.08,yaw_tolerance=.12,align_path=False,station_approach=False):
+                    xy_tolerance=.08,yaw_tolerance=.12,align_path=False,station_approach=False,
+                    budget=None):
         if station_approach and (context is None or align_path or cancel_distance is not None):
             raise ValueError('station approach needs a mission deadline and an ordinary navigation leg')
         if align_path and cancel_distance is not None:
             raise ValueError('entry alignment and distance cancellation require separate trials')
+        started=time.monotonic()
+        budget=budget or NavigationBudget()
         prefix_report=None
         grid=self.grid();start=self.pose()
         pickup_approach=plan.get('pickup_approach',False)
@@ -467,21 +499,26 @@ class Navigator:
                 'navigate',item['name'],0,time.monotonic()+float(plan['timeout_s'])+NavigationExecutor.STOP_BUDGET)
             rospy.set_param('/suat_navigation_gate/path_prefix_target',target)
             try:
-                prefix_report=self.depart_a(context)
+                departure_context=budget.stage(context,'departure',time.monotonic()) if station_approach else context
+                prefix_report=self.depart_a(departure_context)
             finally:
                 if rospy.has_param('/suat_navigation_gate/path_prefix_target'):
                     rospy.delete_param('/suat_navigation_gate/path_prefix_target')
             if not prefix_report['passed']:
                 return dict(prefix_report,name=item['name'],goal=list(item['pose']),
                     motion_goal_sent=prefix_report.get('motion_command_sent',False),
-                    arrival_confirmed=False,error='recorded-goal path prefix failed: '+prefix_report.get('error',''),phase=phase)
+                    arrival_confirmed=False,error='recorded-goal path prefix failed: '+prefix_report.get('error',''),
+                    phase='departure',first_failure_stage='departure',elapsed_s=time.monotonic()-started,
+                    actual_pose=prefix_report['actual_pose'])
             attempts = []
             for attempt in range(2):
                 failure = dict(name=item['name'], goal=list(item['pose']), passed=False,
                                arrival_confirmed=False, phase='post_departure_plan',
                                initial_contact_prefix=prefix_report, planning_failures=attempts,
                                motion_goal_sent=prefix_report['motion_command_sent'],
-                               output_released=prefix_report['output_released'], candidate_unreachable=False)
+                               output_released=prefix_report['output_released'], candidate_unreachable=False,
+                               first_failure_stage='post_departure_plan',elapsed_s=time.monotonic()-started,
+                               actual_pose=self.last_pose())
                 try:
                     if self.health_check:
                         self.health_check()
@@ -537,7 +574,7 @@ class Navigator:
                                     error='plan after entry turn failed: '+(str(exc) or type(exc).__name__),
                                     entry_alignment=entry_report)
         if station_approach:
-            report=self._execute_station(item,plan,context)
+            report=self._execute_station(item,plan,context,budget)
         else:
             selected='pickup' if pickup_approach else ('slow' if phase=='align' and self.owner=='/suat_mission' else None)
             report=self.executor.execute(item,plan,context=context,phase=phase,
@@ -549,6 +586,11 @@ class Navigator:
         if entry_report is not None:
             report['entry_alignment']=entry_report
             report['motion_goal_sent']|=entry_report['motion_goal_sent']
+        report['leg_elapsed_s']=time.monotonic()-started
+        if not report['passed']:
+            report.setdefault('first_failure_stage',report.get('failure_stage',report['phase']))
+            if not report.get('actual_pose'):
+                report['actual_pose']=self.last_pose()
         return report
 
     def cancel(self):
@@ -693,6 +735,8 @@ class RosNavigationTransport:
         def finished(status,result):
             if generation==self.generation:self.terminal=status
         self.sent=True
+        with self.navigator.lock:
+            self.navigator.output_stats=(0,self.now(),0.)
         self.navigator.nav.send_goal(goal,done_cb=finished)
 
     def sample(self):
@@ -703,12 +747,14 @@ class RosNavigationTransport:
         with node.lock:
             state=dict(node.state or {})
             state_age=self.now()-node.state_at
+            output=getattr(node,'output_stats',None)
         status=self.terminal if self.terminal is not None else node.nav.get_state()
         status_text=node.nav.get_goal_status_text() if self.terminal is not None else ''
         return {'generation':self.generation,'status':status,'pose':pose,'odom_pose':odom,
                 'linear':linear,'angular':angular,'age':age,'gate_state':state.get('state'),
                 'gate_age':state_age,'gate_reason':state.get('reason'),'gate_health':state.get('health'),
-                'status_text':status_text}
+                'status_text':status_text, 'output_messages':output[0] if output is not None else 0,
+                'output_max_gap_s':max(output[2],self.now()-output[1]) if output is not None else None}
 
     def release(self):
         return bool(self.service('release').success)

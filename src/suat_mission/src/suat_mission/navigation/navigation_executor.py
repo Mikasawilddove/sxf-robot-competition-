@@ -2,13 +2,14 @@
 import math
 import threading
 from suat_mission.navigation.navigation_test_geometry import arrival_confirmed, arrival_error
+from suat_mission.navigation.navigation_budget import NavigationBudget
 from suat_mission.navigation.navigation_profiles import (
     BOARD_HEADING, BOARD_POSITION, path_travel_fault, planner_speed_limits,
 )
 
 
 class NavigationExecutor:
-    STOP_BUDGET = 5.0
+    STOP_BUDGET = NavigationBudget().stop
 
     def __init__(self, transport):
         self.transport = transport
@@ -34,7 +35,7 @@ class NavigationExecutor:
         io = self.transport
         report = {'name': item['name'], 'goal': list(item['pose']), 'plan': plan,
                   'motion_goal_sent': False, 'arrival_confirmed': False,
-                  'phase': phase, 'passed': False}
+                  'phase': phase, 'passed': False, 'failure_stage': phase}
         with self.command_lock:
             if self.busy:
                 report['error'] = 'another navigation request is already in flight'
@@ -46,6 +47,8 @@ class NavigationExecutor:
         try:
             armed = False
             started = io.now()
+            last_turn = 0
+            report['odom_turn_reversals'] = 0
             parent_deadline = None
             try:
                 self._check()
@@ -141,6 +144,13 @@ class NavigationExecutor:
                                   linear_mps=sample['linear'], angular_radps=sample['angular'], travel_m=travel)
                     report['peak_linear_mps']=max(report.get('peak_linear_mps',0.),abs(sample['linear']))
                     report['peak_angular_radps']=max(report.get('peak_angular_radps',0.),abs(sample['angular']))
+                    if abs(sample['angular']) > .03:
+                        turn = 1 if sample['angular'] > 0 else -1
+                        report['odom_turn_reversals'] += int(last_turn != 0 and turn != last_turn)
+                        last_turn = turn
+                    if sample.get('output_max_gap_s') is not None:
+                        report['output_max_gap_s'] = sample['output_max_gap_s']
+                        report['output_messages'] = sample['output_messages']
                     xy, angle = arrival_error(item['pose'], sample['pose'])
                     report['closest_position_error_m'] = min(report.get('closest_position_error_m', xy), xy)
                     if xy <= xy_tolerance and 'position_tolerance_entered_s' not in report:
@@ -159,6 +169,8 @@ class NavigationExecutor:
                             io.sleep(.05)
                         break
                     if sample['status'] not in (0, 1, 6, 7):
+                        report['terminal_position_error_m'] = xy
+                        report['terminal_yaw_error_rad'] = angle
                         if cancel_distance is None and sample['status'] != 3:
                             report['error'] = (sample.get('status_text') or
                                                f"move_base ended with status {sample['status']}")
@@ -211,6 +223,8 @@ class NavigationExecutor:
                             xy_tolerance, yaw_tolerance))
                     report.update(actual_pose=list(fresh['pose']), linear_mps=fresh['linear'],
                                   angular_radps=fresh['angular'])
+                    report['stopped_position_error_m'], report['stopped_yaw_error_rad'] = arrival_error(
+                        item['pose'],fresh['pose'])
                     if not report['arrival_confirmed']:
                         report['error'] = 'stopped arrival readback is outside tolerance or stale'
                 except Exception as exc:
@@ -221,6 +235,15 @@ class NavigationExecutor:
             report['passed'] = bool(not report.get('error') and completed and report.get('stop_requested')
                                     and report.get('output_released') and not any(
                                         report.get(key) for key in ('stop_error','release_error','heartbeat_error')))
+            report['timed_out'] = any(word in report.get('error','') for word in ('deadline','timeout'))
+            if report['passed']:
+                report.pop('failure_stage')
+            elif not report.get('output_released') and (not report.get('error') or
+                    report.get('error','').endswith('during cleanup')):
+                report['failure_stage'] = 'stop'
+            if report.get('actual_pose'):
+                report['last_position_error_m'],report['last_yaw_error_rad'] = arrival_error(
+                    item['pose'],report['actual_pose'])
             return report
         finally:
             with self.command_lock:

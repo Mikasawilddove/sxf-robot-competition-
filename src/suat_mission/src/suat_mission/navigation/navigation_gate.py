@@ -129,7 +129,14 @@ class NavigationGate:
         self.__init__(self.MAX_V,self.MAX_W,self.MAX_RUN)
 
 
-def goal_is_free(grid, x, y, radius=.25):
+GOAL_PREFILTER_RADIUS_M = .25
+
+
+def goal_check_radius(body_radius, precise_pickup=False):
+    return body_radius + .01 if precise_pickup else max(GOAL_PREFILTER_RADIUS_M, body_radius)
+
+
+def goal_is_free(grid, x, y, radius=GOAL_PREFILTER_RADIUS_M):
     """Check the full conservative circular footprint in a non-rotated map."""
     resolution, width, height = grid['resolution'], grid['width'], grid['height']
     ox, oy = grid['origin']
