@@ -625,9 +625,19 @@ class SerialRosRobot(RosRobot):
         raise TimeoutError('no fresh physical-instance observation from the camera adapter')
 
     def preflight(self, preparing=False):
-        self.serial_runtime.open()
+        if preparing:
+            self._require_preparing()
+        else:
+            self._ensure_running(check_attachment=False)
+        self.serial_runtime.open(preparing=preparing,
+                                 check_preparing=self._require_preparing if preparing else None,
+                                 write_if_running=getattr(self, 'arm_write_if_running', None))
         after=-1 if self.latest_scene is None else self.latest_scene.version
         self._serial_scene(after,time.monotonic()+self.observation_timeout)
+
+    def _require_preparing(self):
+        if rospy.is_shutdown() or self.stop_event.is_set() or not self.preparation_permitted():
+            raise MissionError('preparation was stopped')
 
     def prepare_observation(self, kind):
         self._require_stopped_base()
@@ -755,14 +765,16 @@ class SerialRosRobot(RosRobot):
         return math.hypot(gx-x,gy-y)
 
     def stop_motion(self):
-        RosRobot.stop_motion(self)
-        runtime=getattr(self,'serial_runtime',None)
-        if runtime is not None and runtime.session is not None and runtime.session.handle is not None:
-            runtime.session.stop(time.monotonic()+3.)
+        try:
+            RosRobot.stop_motion(self)
+        finally:
+            runtime=getattr(self,'serial_runtime',None)
+            if runtime is not None and runtime.session is not None:
+                runtime.session.stop(time.monotonic()+3.)
 
     def close(self):
         status=self.serial_runtime.close()
-        self.recovery_required=bool(status.get('pump_may_be_on'))
+        self.recovery_required=bool(status.get('pump_may_be_on') or status.get('ownership_retained'))
         if not self.recovery_required:
             RosRobot.close(self)
         return status
@@ -820,7 +832,7 @@ class Node:
             self.gate.stop()
             robot = self.robot
         rospy.logerr('%s', self.error)
-        if robot:
+        if robot and not self.preparing:
             robot.stop_motion()
         self.publish_state()
 
@@ -931,12 +943,15 @@ class Node:
             robot_type=SerialRosRobot if config.get('execution_backend')=='serial_rgbd' else RosRobot
             robot = robot_type(permitted=lambda: self.gate.permitted(robot.run_token), config=config)
             robot.run_token = None
+            robot.arm_write_if_running = lambda write: self.gate.write_if_running(robot.run_token, write)
             robot.board_evidence_sink = lambda decision: self.record('board_decision', decision)
             robot.navigation_evidence_sink = lambda result: self.record('navigation', result)
-            robot.preparation_permitted = lambda: self.gate.state == 'idle' and not self.error
+            robot.preparation_permitted = lambda: self.preparing and self.gate.state == 'idle' and not self.error
             with self.lock:
                 self.robot = robot
             robot.preflight(preparing=True)
+            if not robot.preparation_permitted():
+                raise MissionError('preparation was stopped')
             robot.prepare_navigation()
             with self.lock:
                 if self.gate.state != 'idle' or self.error:
@@ -944,18 +959,31 @@ class Node:
                 self.record('ready', {'scope': self.scope})
                 self.prepared = True
         except Exception as exc:
-            self.error = 'preparation failed: ' + str(exc)
+            with self.lock:
+                self.error = 'preparation failed: ' + str(exc)
+                self.prepared = False
+                self.gate.stop()
             rospy.logerr('%s', self.error)
-            if robot:
-                robot.close()
-            self.robot = robot if getattr(robot,'recovery_required',False) else None
+            self._close_robot(robot)
             self._close_record_topics()
             if self.recorder and not self.recorder.finished:
                 self._finish_record({'run_id': self.gate.run_id, 'status': 'preparation_failed',
                                      'error': self.error}, {})
         finally:
-            self.preparing = False
-            self.publish_state()
+            with self.lock:
+                self.preparing = False
+                self.publish_state()
+
+    def _close_robot(self, robot):
+        if robot is None:
+            return
+        try:
+            robot.close()
+        except Exception as exc:
+            robot.recovery_required = True
+            self.error = (self.error + '; ' if self.error else '') + 'arm cleanup failed: ' + str(exc)
+            rospy.logerr('%s', self.error)
+        self.robot = robot if getattr(robot, 'recovery_required', False) else None
 
     def command(self, msg):
         try:
@@ -975,16 +1003,20 @@ class Node:
                 try:
                     if self.thread and self.thread.is_alive():
                         raise ValueError('worker is still active')
+                    if self.preparing:
+                        raise ValueError('preparation is still active')
                     if getattr(self.robot,'recovery_required',False):
                         raise ValueError('possible payload retained; use explicit release_for_recovery after supporting it')
-                    self.gate.reset()
                     if self.prepared:
                         self._close_record_topics()
-                        self.robot.close()
-                        self.robot = None
                         self.prepared = False
+                        self._close_robot(self.robot)
                         self._finish_record({'run_id': self.gate.run_id, 'status': 'cancelled_before_start',
                                              'error': 'reset before start'}, {})
+                        if self.robot is not None:
+                            self.gate.stop()
+                            raise ValueError('serial ownership is retained for recovery')
+                    self.gate.reset()
                     self.error = None
                     self.publish_state()
                 except ValueError as exc:
@@ -992,8 +1024,8 @@ class Node:
             return
         if value == 'prepare':
             with self.lock:
-                if (self.preparing or self.prepared or self.gate.active is not None
-                        or self.gate.state != 'idle' or getattr(self.robot,'recovery_required',False)):
+                if (self.preparing or self.prepared or self.robot is not None or self.gate.active is not None
+                        or self.gate.state != 'idle' or (self.thread and self.thread.is_alive())):
                     rospy.logwarn('Preparation refused: reset after the previous run first')
                     return
                 self.error = None
@@ -1003,7 +1035,12 @@ class Node:
                 self.preparation_id = request.get('request_id') or uuid.uuid4().hex
                 self.thread = threading.Thread(target=self.prepare,
                     args=(request.get('scope'), request.get('entered_at_monotonic')), daemon=True)
-                self.thread.start()
+                try:
+                    self.thread.start()
+                except Exception as exc:
+                    self.preparing = False
+                    self.gate.stop()
+                    self.error = 'could not start preparation worker: ' + str(exc)
                 self.publish_state()
             return
         if value != 'start':
@@ -1017,6 +1054,7 @@ class Node:
                 rospy.logwarn('Start refused: prepared run ID mismatch')
                 return
             token = None
+            recorded = False
             try:
                 token = self.gate.start()
                 self.recorder.start(self.gate.started_at, self.gate.deadline,
@@ -1025,30 +1063,29 @@ class Node:
                                      'stop_margin_s': self.gate.stop_margin,
                                      'judge_clock_already_running': self.gate.clock_already_running,
                                      'budget_anchor_monotonic': self.gate.budget_anchor})
+                recorded = True
+                self.prepared = False
+                self.robot.run_token = token
+                self.thread = threading.Thread(target=self.run, args=(token,), daemon=True)
+                self.thread.start()
             except Exception as exc:
+                self.prepared = False
+                self.gate.stop()
                 if token is not None:
-                    self.record_failed(exc)
                     self.gate.finish(token)
-                else:
-                    self.error = 'start refused: ' + str(exc)
-                    self.prepared = False
-                    self.gate.stop()
+                self.error = 'start failed: ' + str(exc)
+                if self.robot is not None:
+                    self.robot.run_token = None
                 self._close_record_topics()
-                if self.robot:
-                    self.robot.close()
-                    self.robot = None
-                report = {'run_id': self.gate.run_id,
-                          'status': 'start_refused' if token is None else 'recording_failed_before_execution',
-                          'error': self.error}
+                self._close_robot(self.robot)
+                status = 'start_refused' if token is None else (
+                    'startup_failed_before_execution' if recorded else 'recording_failed_before_execution')
+                report = {'run_id': self.gate.run_id, 'status': status, 'error': self.error}
                 self._finish_record(report, {})
                 self.report_pub.publish(String(data=json.dumps(report)))
                 self.publish_state()
                 rospy.logwarn('Start refused: %s', exc)
                 return
-            self.prepared = False
-            self.robot.run_token = token
-            self.thread = threading.Thread(target=self.run, args=(token,), daemon=True)
-            self.thread.start()
             self.publish_state()
 
     def _finish_record(self, report, final_state):
@@ -1089,6 +1126,7 @@ class Node:
                                     deadline=self.gate.deadline,
                                     event_sink=lambda text: self.record('mission', {'message': text})).run())
         except Exception as exc:
+            self.gate.stop()
             rospy.logerr('Mission preflight failed: %s', exc)
             report['error'] = str(exc)
         finally:
@@ -1108,23 +1146,26 @@ class Node:
                                 'last_measured_arm_pose_mm':runtime.arm_pose,
                                 'pump_may_be_on':bool(runtime.session and runtime.session.pump_may_be_on)}
                     finally:
-                        robot.close()
+                        robot.run_token = None
+                        self._close_robot(robot)
             except Exception as exc:
                 report['stop_or_recording_error'] = str(exc)
                 self.error = str(exc)
             finally:
-                self._close_record_topics()
-                final_state['stop_requested_at'] = self.stop_requested_at
-                self._finish_record(report, final_state)
-                report['run_directory'] = str(self.recorder.path)
-                if self.error:
-                    report['recording_or_stop_error'] = self.error
-                self.report_pub.publish(String(data=json.dumps(report)))
-                rospy.logwarn('Mission %s; delivered=%s; error=%s', report['status'], report.get('delivered'), report['error'])
-                with self.lock:
-                    self.gate.finish(token)
-                    self.robot = robot if getattr(robot,'recovery_required',False) else None
-                    self.publish_state()
+                try:
+                    self._close_record_topics()
+                    final_state['stop_requested_at'] = self.stop_requested_at
+                    self._finish_record(report, final_state)
+                    report['run_directory'] = str(self.recorder.path)
+                    if self.error:
+                        report['recording_or_stop_error'] = self.error
+                    self.report_pub.publish(String(data=json.dumps(report)))
+                    rospy.logwarn('Mission %s; delivered=%s; error=%s',
+                                  report['status'], report.get('delivered'), report.get('error'))
+                finally:
+                    with self.lock:
+                        self.gate.finish(token)
+                        self.publish_state()
 
     def stop(self, msg):
         if msg.data:
@@ -1133,6 +1174,24 @@ class Node:
                 self.prepared = False
                 self.stop_requested_at = time.monotonic()
                 robot = self.robot
+                if self.preparing:
+                    # Only the Prepare worker owns that lifecycle and can close
+                    # a port while its initialization is unwinding.
+                    if robot is not None:
+                        robot.stop_event.set()
+                    self.publish_state()
+                    return
+                worker_active = self.gate.active is not None
+                if not worker_active:
+                    self._close_robot(robot)
+                    if self.recorder and not self.recorder.finished:
+                        self._close_record_topics()
+                        report = {'run_id': self.gate.run_id, 'status': 'cancelled_before_start',
+                                  'error': 'stop before start'}
+                        self._finish_record(report, {'stop_requested_at': self.stop_requested_at})
+                        self.report_pub.publish(String(data=json.dumps(report)))
+                    self.publish_state()
+                    return
             if self.recorder and not self.recorder.finished:
                 try:
                     if self.gate.started_at is not None:
@@ -1142,31 +1201,30 @@ class Node:
                 except Exception as exc:
                     rospy.logerr('Stop recording failed: %s', exc)
             if robot:
-                robot.stop_motion()
-                if self.gate.active is None and not self.preparing:
-                    robot.close()
-                    self.robot = robot if getattr(robot,'recovery_required',False) else None
-            if self.recorder and not self.recorder.finished and self.gate.active is None and not self.preparing:
-                self._close_record_topics()
-                report = {'run_id': self.gate.run_id, 'status': 'cancelled_before_start', 'error': 'stop before start'}
-                self._finish_record(report, {'stop_requested_at': self.stop_requested_at})
-                self.report_pub.publish(String(data=json.dumps(report)))
+                try:
+                    robot.stop_motion()
+                except Exception as exc:
+                    self.error = 'stop request failed: ' + str(exc)
+                    rospy.logerr('%s', self.error)
             self.publish_state()
 
     def release_for_recovery(self, request):
         """Explicit operator recovery after an aborted possible-held state, never a mission step."""
         from std_srvs.srv import TriggerResponse
         with self.lock:
-            if self.gate.active is not None or self.preparing:
+            if self.gate.active is not None or self.preparing or self.prepared:
                 return TriggerResponse(False,'mission worker is still active')
             robot=self.robot
             if not getattr(robot,'recovery_required',False):
                 return TriggerResponse(False,'no retained serial session needs release')
             try:
-                runtime=robot.serial_runtime
-                runtime.session.pump(False,deadline=time.monotonic()+8.)
-                runtime.held=None
-                robot.close();self.robot=None
+                runtime=getattr(robot,'serial_runtime',None)
+                if runtime is not None and runtime.session is not None and runtime.session.pump_may_be_on:
+                    runtime.session.pump(False,deadline=time.monotonic()+8.,recovery=True)
+                    runtime.held=None
+                self._close_robot(robot)
+                if self.robot is not None:
+                    return TriggerResponse(False,'serial ownership remains retained')
                 self.publish_state()
                 return TriggerResponse(True,'pump off; retained session closed; reset before preparation')
             except Exception as exc:
