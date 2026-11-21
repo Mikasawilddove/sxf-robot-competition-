@@ -619,6 +619,7 @@ class SerialMissionRuntime:
         evidence = dict(run_id=run_id, station=station, geometry_file=str(geometry_file),
                         direction_source='fixed_reference', slot_order=list(zones))
         last_view = None
+        best_count = -1
         mapping = {}
         while time.monotonic() < deadline and not mapping:
             self.ensure()
@@ -633,27 +634,34 @@ class SerialMissionRuntime:
             if tuple(image.shape[1::-1]) != views[0].image_size:
                 continue
             visible = visible_board_view(image, views[0])
-            for view in ([visible] if visible is not None else views):
-                detections = matcher.detect_board(view.normalize(image))['detections']
+            for view in ([visible, *views] if visible is not None else views):
+                ranks = matcher.match_board_slots(view.normalize(image))
                 slots = {}
-                for detection in sorted(detections, key=lambda item: item.score, reverse=True):
-                    slot = int(3*detection.x/view.normalized_size[0])
-                    if 0 <= slot < len(zones):
-                        slots.setdefault(slot, detection)
-                last_view = (msg, image, view, tuple(slots.values()), stamp, visible is not None)
-                if {item.label for item in slots.values()} == set(OBJECTS):
+                for index, rank in enumerate(ranks):
+                    if rank and rank[0].score >= matcher.threshold and (
+                            len(rank) == 1 or rank[1].score < matcher.threshold
+                            or rank[0].score - rank[1].score >= .1):
+                        slots[index] = rank[0]
+                complete = {item.label for item in slots.values()} == set(OBJECTS)
+                if complete or len(slots) > best_count:
+                    best_count = len(slots)
+                    scores = {zone: [{'label': item.label, 'score': item.score} for item in rank[:2]]
+                              for zone, rank in zip(zones, ranks)}
+                    last_view = (msg, image, view, tuple(slots.values()), stamp, view is visible, scores)
+                if complete:
                     mapping = {slots[i].label: zone for i, zone in enumerate(zones)}
                     break
 
         accepted = bool(mapping)
         reason = 'accepted' if accepted else 'board_not_read'
         if last_view is not None:
-            msg, image, view, detections, stamp, observed = last_view
+            msg, image, view, detections, stamp, observed, scores = last_view
             image_file = directory / 'board_frame.png'
             cv2.imwrite(str(image_file), image)
             evidence.update(image=str(image_file.relative_to(self.run)), stamp_ns=stamp,
                             selected_geometry_id=view.geometry_id, geometry=view.evidence(),
-                            geometry_source='visible_outline' if observed else 'recorded_reference')
+                            geometry_source='visible_outline' if observed else 'recorded_reference',
+                            slot_scores=scores)
             overlay.render(msg, image, view, (), detections, zones, reason, mapping,
                            'Fixed slots: B | C | D', save=directory / 'mission_overlay.png')
         self.event('board_result', accepted=accepted, reason=reason, mapping=mapping, **evidence)

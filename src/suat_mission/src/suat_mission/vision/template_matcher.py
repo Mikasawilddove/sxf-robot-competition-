@@ -119,3 +119,23 @@ class TemplateMatcher:
                 'suppressed':suppressed,'coordinate_space':'normalized_board',
                 'parameters':{'slot_edges':list(slot_edges),'containment':containment,
                               'score_margin':score_margin,'score_semantics':'TM_CCOEFF_NORMED'}}
+
+    def match_board_slots(self, image):
+        """Rank the three printed classes independently in each rectified slot."""
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
+        edges = np.linspace(0, gray.shape[1], 4, dtype=int)
+        ranks = []
+        for start, end in zip(edges, edges[1:]):
+            region = gray[:, start:end]
+            best = {}
+            for label, template in self.variants:
+                height, width = template.shape
+                if label not in OBJECTS or height > region.shape[0] or width > region.shape[1]:
+                    continue
+                response = cv2.matchTemplate(region, template, cv2.TM_CCOEFF_NORMED)
+                _, score, _, (x, y) = cv2.minMaxLoc(response)
+                if label not in best or score > best[label].score:
+                    best[label] = Detection(label, max(0., min(1., score)),
+                                            start + x + width/2., y + height/2., width, height)
+            ranks.append(sorted(best.values(), key=lambda item: item.score, reverse=True))
+        return ranks
