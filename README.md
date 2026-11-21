@@ -7,7 +7,7 @@
 | 模块 | 路径 | 职责 |
 | --- | --- | --- |
 | 导航 | [navigation/](src/suat_mission/src/suat_mission/navigation/) | A 点定位、路径规划与执行、底盘安全门控 |
-| 视觉 | [vision/](src/suat_mission/src/suat_mission/vision/) | RGB-D 场景识别、分类板新帧投票 |
+| 视觉 | [vision/](src/suat_mission/src/suat_mission/vision/) | RGB-D 场景识别、分类板三槽匹配 |
 | 机械臂 | [manipulation/](src/suat_mission/src/suat_mission/manipulation/) | 抓取几何、机械臂控制和抓放反馈 |
 | 自动化 | [automation/](src/suat_mission/src/suat_mission/automation/) | 任务状态机、读板站选择、单 Enter 控制和运行记录 |
 | 运行配置 | [config/](src/suat_mission/config/) · [launch/](src/suat_mission/launch/) | ROS 参数、节点连接、RViz 显示 |
@@ -15,21 +15,24 @@
 
 ## 正式启动
 
-本分支以真机 `spark-direct-board-e6e4276.FZEiBY` 的实际源码为基线。仓库收录执行代码，现场资源按原路径配置。使用 Ubuntu 20.04 / ROS 1 Noetic 和现有 Spark-I、SwiftPro、RealSense 驱动。在这份 checkout 内加载 Noetic 与底层驱动环境，再运行 `catkin_make`。部署到现有真机工作区时保留该工作区的现场资源。
+真机的正式工作区是 `/home/spark/SUAT/spark`。正式源码来自 `spark-direct-board-e6e4276.FZEiBY` 的实机版本，读板更新对应提交 `78f03db`。仓库收录执行代码，现场资源按原路径配置。部署时在正式路径加载 ROS 1 Noetic 与底层驱动环境，并在该路径运行 `catkin_make`。
 
 ```bash
-bash tools/run_field_match.sh
+cd /home/spark/SUAT/spark
+bash tools/run_field_match.sh cake-only
 ```
 
 将机器人摆在已标定的 A 区起点，朝 D。等待启动提示后按一次 Enter。正式入口固定选用这个工作区的 `path` 导航、`fast` 档和西侧抓取标定。启动程序会核对 `suat_mission` 解析到当前工作区。脚本启动相机、定位和任务节点，在有桌面时显示相机与 RViz。
 
-正式流程先停车读分类板，将蛋糕送入 A 区并确认落区，再按本局 B/C/D 映射搬运熊、时钟和香蕉。单蛋糕试验仍可使用同一个入口：
+正式流程先停车读分类板，将蛋糕送入 A 区并确认落区，再按本局 B/C/D 映射搬运熊、时钟和香蕉。整场验收使用同一个入口：
 
 ```bash
-bash tools/run_field_match.sh cake-only
+bash tools/run_field_match.sh full
 ```
 
 蛋糕按实抓配套四系数求 XY，并使用 20 cm 标定面的实测接触 Z。三种普通块按自己的 RGB-D 顶面求抓取点，由控制器验证可达性。携带时使用吸盘附近的 RGB-D 证据，观测断流或确认空手时沿用停车逻辑。到放置站后继续使用原有的落区观测流程。
+
+分类板校正后按左、中、右三个槽独立匹配模板，分别绑定 B、C、D。读全时写入本局映射。AR 地码保留给视觉专项观察。
 
 ## 本地现场资源
 
@@ -42,3 +45,9 @@ bash tools/run_field_match.sh cake-only
 ## 实机验证记录
 
 真机运行 `04d34e3d92a8435c860f88c1a922be17` 完成读板、西侧抓起及持物确认，在前往 Collection_A 时因持物观测超时中止。对应的修复已在真机工作区编译，并用模拟输入验证了运输时的观测分支和普通块接触点计算。修复后的 A 区交付及三类普通块全程仍待真机验收。
+
+三槽读板已回放成功帧、裁切失败帧及停稳实拍。前移 5 cm 的站位是静态净空通过的候选。正式流程使用已录的读板站。
+
+主工作区已在本路径重新编译。真机预览 `competition_start_20261103_223112` 确认任务节点、导航节点和蛋糕标定均从 `/home/spark/SUAT/spark` 加载，相机提供新的 RGB-D 场景。预览阶段底盘保持取消授权，任务处于空闲。
+
+真机 `tools/west_grasp_20261121/` 是 mrobot(2) 的独立抓取工作区，包含独立源码、标定和试验记录。普通块四系数方案仍在该处单独验收。
