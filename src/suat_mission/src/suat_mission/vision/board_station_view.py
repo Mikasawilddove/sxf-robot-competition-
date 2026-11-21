@@ -52,17 +52,26 @@ def station_views(config, station):
 
 def visible_board_view(image, reference):
     """Recover the bright printed board face near a recorded station view."""
+    for padding, levels, suffix in ((.6, (65, 85), '_visible_outline'),
+                                     (.9, (60, 85), '_visible_outline_expanded')):
+        view = _visible_outline(image, reference, padding, levels, suffix)
+        if view is not None:
+            return view
+    return None
+
+
+def _visible_outline(image, reference, padding, levels, suffix):
     import cv2
     import numpy as np
     corners = np.asarray(reference.corners, dtype=np.float32)
     span = np.ptp(corners, axis=0)
-    pad = int(span[1] * .6)
+    pad = int(span[1] * padding)
     width, height = reference.image_size
     x0, y0 = np.maximum(np.floor(corners.min(axis=0)).astype(int) - pad, 0)
     x1, y1 = np.minimum(np.ceil(corners.max(axis=0)).astype(int) + pad, (width, height))
     gray = cv2.cvtColor(image[y0:y1, x0:x1], cv2.COLOR_BGR2GRAY)
     smooth = cv2.GaussianBlur(gray, (3, 3), 0)
-    background, paper = np.percentile(smooth, (65, 85))
+    background, paper = np.percentile(smooth, levels)
     if paper - background < 8.:
         return None
     reference_area = cv2.contourArea(corners)
@@ -93,7 +102,7 @@ def visible_board_view(image, reference):
             center = quad.mean(axis=0)
             quad = np.clip(center + (quad - center) * (1.035, 1.09), (0, 0), (width - 1, height - 1))
             return BoardGeometry(reference.image_size, quad, reference.normalized_size,
-                                 reference.geometry_id + '_visible_outline')
+                                 reference.geometry_id + suffix)
     return None
 
 
