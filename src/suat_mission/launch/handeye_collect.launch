@@ -1,0 +1,48 @@
+<launch>
+  <!-- 手眼标定采集：需要相机 + swiftpro_write_node 已在运行。
+       默认 dry_run=true，只打印路径不动臂；确认路径无误后再设 dry_run:=false。 -->
+
+  <arg name="dry_run" default="true"/>
+  <arg name="aruco_id" default="7"/>
+  <arg name="aruco_dict" default="DICT_4X4_50"/>
+  <arg name="aruco_size_mm" default="40.0"/>
+  <arg name="start_xyz" default=""/>
+  <arg name="step_mm" default="3.0"/>
+  <arg name="dwell_s" default="0.35"/>
+  <arg name="arm_z_min" default="-20.0"/>
+  <arg name="arm_z_max" default="180.0"/>
+  <arg name="out_file" default="$(env HOME)/SUAT/spark/data/calibration/handeye_pairs.json"/>
+
+  <node pkg="suat_mission" type="handeye_collect.py" name="handeye_collect" output="screen">
+    <param name="dry_run" value="$(arg dry_run)"/>
+    <param name="aruco_id" value="$(arg aruco_id)"/>
+    <param name="aruco_dict" value="$(arg aruco_dict)"/>
+    <param name="aruco_size_mm" value="$(arg aruco_size_mm)"/>
+    <param name="start_xyz" value="$(arg start_xyz)"/>
+    <param name="step_mm" value="$(arg step_mm)"/>
+    <param name="dwell_s" value="$(arg dwell_s)"/>
+    <param name="arm_z_min" value="$(arg arm_z_min)"/>
+    <param name="arm_z_max" value="$(arg arm_z_max)"/>
+    <param name="out_file" value="$(arg out_file)"/>
+    <param name="settle_frames" value="5"/>
+    <param name="settle_px" value="1.5"/>
+    <param name="min_depth_mm" value="120.0"/>
+    <param name="max_depth_mm" value="1200.0"/>
+    <param name="cluster_tolerance_mm" value="12.0"/>
+    <param name="max_residual_mm" value="6.0"/>
+
+    <!-- 9 个标定点，覆盖 x/y/z 三个方向的展开，避免共面导致旋转解漂移。
+         全部在 z>=30mm，离桌面留出安全余量。 -->
+    <rosparam param="points">
+      [150.0, -70.0, 30.0,
+       150.0,  70.0, 30.0,
+       230.0, -70.0, 30.0,
+       230.0,  70.0, 30.0,
+       190.0,   0.0, 90.0,
+       150.0,   0.0, 110.0,
+       230.0,   0.0, 110.0,
+       190.0, -70.0, 70.0,
+       190.0,  70.0, 70.0]
+    </rosparam>
+  </node>
+</launch>

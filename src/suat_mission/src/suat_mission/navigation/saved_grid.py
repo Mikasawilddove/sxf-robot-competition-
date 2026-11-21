@@ -1,5 +1,6 @@
 """Portable map_server PGM reader; no OpenCV, ROS or package installation needed."""
 import ast
+import json
 import math
 from pathlib import Path
 import re
@@ -90,9 +91,22 @@ def load_saved_grid(root):
             'origin_yaw': yaw, 'negate': config.get('negate', 0), 'mode': 'trinary',
             'free_thresh': free, 'occupied_thresh': occupied,
             'frame_id': selected.get('frame_id'), 'layout_version': selected.get('layout_version'),
-            'alignment_version': selected.get('alignment_version'),
+            'alignment_version': selected.get('map_record_alignment_version', selected.get('alignment_version')),
             'grid_sha256':selected.get('grid_sha256'), 'identity_method':'selected_path_and_geometry'}
     map_identity(binding)
     if binding['frame_id'] != 'map':
         raise ValueError('navigation currently supports only the map frame')
+    field_file = selected.get('field_alignment_file')
+    if field_file:
+        from suat_mission.navigation.field_alignment import validate_alignment
+        field_path = (root/field_file).resolve()
+        field_path.relative_to(root)
+        version = selected['alignment_version']
+        if version == 'UNALIGNED':
+            raise ValueError('selected field transform requires a named alignment version')
+        record = json.loads(field_path.read_text(encoding='utf-8'))
+        binding.update(field_alignment=validate_alignment(record, binding, version),
+                       field_alignment_file=str(field_path))
+    elif 'map_record_alignment_version' in selected:
+        raise ValueError('selected field alignment file is missing')
     return binding

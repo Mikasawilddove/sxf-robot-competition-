@@ -5,16 +5,12 @@ from pathlib import Path
 import time
 
 from suat_mission.contracts import ActionResult, Outcome
+from suat_mission.manipulation.arm_path import FEED_FAST
 from suat_mission.manipulation.pickup_geometry import PickupGeometry, GeometryUnavailable
 from suat_mission.navigation.map_identity import validate_map_identity
 from suat_mission.navigation.navigation_map import load_binding
 from suat_mission.navigation.board_stations import board_station_candidates
-
-
-class BaseAlignmentRequired(GeometryUnavailable):
-    def __init__(self,error):
-        super().__init__('measured cup correction is outside controller reach')
-        self.error=error
+from suat_mission.navigation.stations import mission_stations
 
 
 def resource(root, value):
@@ -35,24 +31,11 @@ def resolve_serial_config(config, root):
     validate_map_identity(route,binding)
     result['recorded_route_file']=str(filename)
     result['waypoint_map_identity']=route['map_identity']
-    points = {p['name']:p['pose'] for p in route['waypoints']}
-    for name,pose in result.get('waypoints',{}).items():
-        if name in points and points[name]!=pose:
-            raise ValueError('mission config conflicts with recorded station: '+name)
-        points[name]=pose
-    bcd = result.get('additional_waypoints_file')
-    if bcd and resource(root,bcd).exists():
-        data=json.loads(resource(root,bcd).read_text(encoding='utf-8'))
-        validate_map_identity(data,binding)
-        additions=data.get('waypoints',data)
-        if isinstance(additions,list): additions={p['name']:p['pose'] for p in additions}
-        for name,pose in additions.items():
-            if name in points and points[name]!=pose:
-                raise ValueError('additional waypoints conflict with recorded station: '+name)
-            points[name]=pose
+    stations = mission_stations(root, result, binding)
+    points = {name: entry['pose'] for name, entry in stations.items()}
+    if result.get('pickup_stations_file'):
+        result['pickup_stations_file'] = str(resource(root,result['pickup_stations_file']))
     result['waypoints'] = points
-    if result.get('mission_scope') == 'cake-only':
-        result['max_base_alignments'] = 0
     if result.get('board_station_records_file'):
         station_file = resource(root, result['board_station_records_file'])
         records = json.loads(station_file.read_text(encoding='utf-8'))
@@ -75,10 +58,13 @@ def resolve_serial_config(config, root):
 
 
 class SerialMissionRuntime:
-    def __init__(self, root, config, next_scene, ensure_running, align_base):
+    def __init__(self, root, config, next_scene, ensure_running):
         self.root, self.config = Path(root), config
+        self.confirm_frames = config.get('manipulation_confirm_frames', 2)
+        if type(self.confirm_frames) is not int or self.confirm_frames < 1:
+            raise ValueError('manipulation_confirm_frames must be a positive integer')
         self.geometry = PickupGeometry.load(config['pickup_geometry_file'])
-        self.next_scene, self.ensure, self.align_base = next_scene, ensure_running, align_base
+        self.next_scene, self.ensure = next_scene, ensure_running
         self.run = Path(config['run_directory'])/'manipulation'
         self.run.mkdir(parents=True,exist_ok=True)
         self.session = None
@@ -88,7 +74,6 @@ class SerialMissionRuntime:
         self.selected_target = None
         self.arm_pose = None
         self.last_hold_seen = 0.
-        self.empty_seen = False
         self.slots = {}
         self.events = []
         self.active_pub = None
@@ -97,6 +82,7 @@ class SerialMissionRuntime:
         self.last_scene = None
         self.bootstrapped=False
         self.zone=None
+        self.grasp_camera_offset = (0., 0., 0.)
 
     def event(self, phase, **values):
         self.events.append(dict(phase=phase, at=time.monotonic(), **values))
@@ -107,23 +93,35 @@ class SerialMissionRuntime:
         from std_msgs.msg import String
         if self.active_pub is None:
             self.active_pub=rospy.Publisher('/suat/manipulation/active',String,queue_size=1,latch=True)
-        self.active_pub.publish(String(data=json.dumps({
-            'phase':phase,'object_id':getattr(target or self.selected_target,'object_id',self.held or ''),
-            'label':getattr(target or self.selected_target,'label',self.held_label),
+        target=target or self.selected_target
+        payload={
+            'phase':phase,'object_id':getattr(target,'object_id',self.held or ''),
+            'label':getattr(target,'label',self.held_label),
             'calibration_id':self.geometry.calibration_id,'stamp':rospy.Time.now().to_sec(),
             'zone':self.zone,
-            'arm_pose_mm':self.arm_pose,'cup_offset_mm':self.geometry.cup_offset})))
+            'arm_pose_mm':self.arm_pose,'cup_offset_mm':self.geometry.cup_offset}
+        if phase == 'observe_objects':
+            payload['center_ordinary_top'] = True
+        if self.held and phase in ('lift', 'hold_view', 'transport', 'carrying', 'observe_placement'):
+            cup = [v-d for v,d in zip(self.arm_pose,self.grasp_camera_offset)]
+            cup[2] -= self.geometry.cup_offset
+            payload['payload_cup_arm_mm'] = cup
+        self.active_pub.publish(String(data=json.dumps(payload)))
 
-    def open(self):
+    def open(self, *, preparing=False, check_preparing=None, write_if_running=None):
         if self.session is not None:
+            if not preparing and not self.session.initialized:
+                self.session.enable_motion()
+                self.arm_pose=self.session.read_pose(time.monotonic()+3.)['xyz']
+                self.event('serial_initialized', measured_pose_mm=self.arm_pose)
             return
         from suat_mission.manipulation.arm_session import ArmSession
-        self.session=ArmSession(self.run,feed=float(self.config.get('arm_feed_mm_min',1000.)))
-        self.session.fast_feed=float(self.config.get('arm_fast_feed_mm_min',80000.))
-        self.session.contact_feed=float(self.config.get('arm_contact_feed_mm_min',40000.))
-        self.session.correction_feed=float(self.config.get('arm_correction_feed_mm_min',1000.))
+        self.session=ArmSession(self.run,feed=FEED_FAST)
         self.session.permitted=lambda: self._permitted()
-        self.session.open()
+        self.session.write_if_running=write_if_running
+        self.session.open(preparing=preparing,check_preparing=check_preparing)
+        if check_preparing is not None:
+            check_preparing()
         self.arm_pose=self.session.read_pose(time.monotonic()+3.)['xyz']
         self.event('serial_open', measured_pose_mm=self.arm_pose)
 
@@ -134,25 +132,55 @@ class SerialMissionRuntime:
         except Exception:
             return False
 
-    def move(self, phase, xyz, deadline, loaded=False):
+    def move(self, phase, xyz, deadline, loaded=False, *, target_prevalidated=False):
         self.ensure()
-        self.geometry.check_pose(xyz)
+        pickup = phase in ('approach', 'contact', 'lift', 'static_return_above', 'static_return_contact')
+        if not target_prevalidated:
+            label = getattr(self.selected_target, 'label', None) if pickup else None
+            self.geometry.check_pose(xyz, pickup_label=label)
         self.event(phase,status='moving',target_mm=xyz)
-        measurement=self.session.go(phase,xyz,loaded=loaded,deadline=deadline)
-        self.arm_pose=self.session.read_pose(deadline)['xyz']
+        measurement=self.session.go(phase,xyz,loaded=loaded,deadline=deadline,
+                                    target_prevalidated=target_prevalidated)
+        self.arm_pose=measurement['measurements'][-1]['xyz']
         self.observed_after=time.monotonic()
         self.event(phase, target_mm=xyz, measured_pose_mm=self.arm_pose, measurement=measurement)
         self.active(phase)
 
-    def observation(self, kind, deadline):
+    def prepare_empty_observation(self, unfolded_pose, deadline, *, left_view=None):
+        self.open()
+        self.ensure()
+        if self.held is not None or self.session.pump_may_be_on:
+            raise RuntimeError('workpose recovery requires an empty arm with the pump off')
+        home = self.geometry.check_pose(self.geometry.values['empty_travel_pose_mm'])
+        side = self.geometry.check_pose(
+            left_view if left_view is not None else self.geometry.values['observation_pose_mm'])
+        tolerance = self.session.correction_tolerance_mm
+        start = self.arm_pose
+        if (math.dist(start, side) <= tolerance
+                or (left_view is None and math.dist(start, home) <= tolerance)):
+            return
+
+        # The front fold is below the normal grasp workspace. All motion
+        # targets still pass the existing workspace and controller IK checks.
+        front = self.geometry.bounds[0] if self.geometry.bounds is not None else 0.
+        if 0. < start[0] < front and math.hypot(*start[:2]) < front and start[2] < unfolded_pose[2]:
+            self.move('unfold_empty_arm', unfolded_pose, deadline)
+            if left_view is None:
+                self.move('center_workpose', home, deadline)
+        else:
+            self.geometry.check_pose(start)
+            if start[2] < unfolded_pose[2] - tolerance:
+                clearance = [start[0], start[1], unfolded_pose[2]]
+                self.move('raise_empty_arm', clearance, deadline)
+        if left_view is not None:
+            self.move('pickup_camera_left', side, deadline)
+
+    def observe_objects(self):
         if self.held is not None:
             raise RuntimeError('cannot use an empty observation pose while carrying')
-        key='board_observation_pose_mm' if kind=='board' else 'observation_pose_mm'
-        pose=self.geometry.values.get(key,self.geometry.values.get('observation_pose_mm'))
-        if pose is None:
-            raise GeometryUnavailable('missing observation pose: '+key)
-        self.move('observe_'+kind,list(pose),deadline)
-        self.active('observe_'+kind)
+        self.selected_target = None
+        self.observed_after = time.monotonic()
+        self.active('observe_objects')
 
     def fresh_scene(self,deadline):
         while time.monotonic()<deadline:
@@ -161,7 +189,7 @@ class SerialMissionRuntime:
                 raise RuntimeError('instance producer restarted during the mission')
             self.scene_id=scene.scene_id
             if scene.observed_at<self.observed_after:continue
-            self.last_scene=scene;self.observe_hand(scene)
+            self.last_scene=scene
             return scene
         raise TimeoutError('fresh synchronized scene unavailable')
 
@@ -181,19 +209,10 @@ class SerialMissionRuntime:
             if self.last_scene.manipulation.get('calibration',{}).get('status')!='translation_refined':
                 raise GeometryUnavailable('measured camera/arm reference pairs did not agree')
             self.event('camera_translation_refined',observation=self.last_scene.manipulation['calibration'])
+        else:
+            self.event('camera_calibration_loaded', calibration_id=self.geometry.calibration_id,
+                       source_file=self.geometry.values.get('source_file'))
         self.bootstrapped=True
-
-    def reachable_grasp(self,contact,approach,lift,deadline):
-        points=[contact,[contact[0],contact[1],contact[2]+approach],
-                [contact[0],contact[1],contact[2]+lift]]
-        for point in points:
-            self.geometry.check_pose(point)
-            if not self.session.validate_target(point,deadline):return False
-        # Check the actual straight connections, not merely isolated endpoints.
-        for a,b in zip(points,points[1:]):
-            for t in (.25,.5,.75):
-                if not self.session.validate_target([a[i]+(b[i]-a[i])*t for i in range(3)],deadline):return False
-        return True
 
     @staticmethod
     def observed_cup(scene):
@@ -208,234 +227,287 @@ class SerialMissionRuntime:
         tolerance=float(self.geometry.values.get('holding_position_tolerance_mm',25.))
         return cup is not None and math.dist(point,cup)<=tolerance
 
-    def align_tool(self,target,deadline):
-        # Keep the point fitted before the arm obscures the centre of the face.
-        # A fresh frame must still show the same object and support plane.
-        top=self.geometry.point(target)
-        edge_clearance=target.surface['edge_margin_mm']-self.geometry.cup_radius
-        tolerance=min(edge_clearance,float(self.geometry.values.get('alignment_tolerance_mm',5.)))
-        height_tolerance=float(self.geometry.values.get('height_tolerance_mm',12.))
-        step=float(self.geometry.values.get('max_visual_correction_mm',30.))
-        required=int(self.config.get('manipulation_confirm_frames',2))
-        aligned=[]
-        corrections=0
-        until=min(deadline,time.monotonic()+8.)
-        try:
-            while time.monotonic()<until:
-                scene=self.fresh_scene(until)
-                current=next((d for d in scene.detections if d.object_id==target.object_id),None)
-                cup=self.observed_cup(scene)
-                if current is None or cup is None:
-                    aligned.clear()
-                    continue
-                surface=current.surface
-                normal=surface.get('plane_normal_arm')
-                offset=surface.get('plane_offset_arm_mm')
-                if (not normal or len(normal)!=3 or not all(math.isfinite(v) for v in normal)
-                        or normal[2]<=0. or offset is None or not math.isfinite(offset)):
-                    aligned.clear()
-                    continue
-                height_at_lock=(offset-normal[0]*top[0]-normal[1]*top[1])/normal[2]
-                if abs(height_at_lock-top[2])>height_tolerance:
-                    raise GeometryUnavailable('selected top changed height after approach')
-                error=[top[0]-cup[0],top[1]-cup[1]]
-                distance=math.hypot(*error)
-                gap=cup[2]-(offset-normal[0]*cup[0]-normal[1]*cup[1])/normal[2]
-                if gap<0.:
-                    raise GeometryUnavailable('observed cup is already below the selected top plane')
-                self.event('visual_alignment',target_id=target.object_id,locked_top_mm=top,
-                    observed_cup_mm=cup,xy_error_mm=error,remaining_vertical_gap_mm=gap)
-                if distance<=tolerance:
-                    if aligned and abs(aligned[-1]-gap)>tolerance:
-                        aligned.clear()
-                    aligned.append(gap)
-                    if len(aligned)>=required:
-                        return [self.arm_pose[0],self.arm_pose[1],self.arm_pose[2]-sum(aligned)/len(aligned)]
-                    continue
-                if corrections>=2:
-                    raise GeometryUnavailable('visual cup/target error exceeds bounded local correction')
-                scale=min(1.,step/distance)
-                goal=[self.arm_pose[0]+error[0]*scale,self.arm_pose[1]+error[1]*scale,self.arm_pose[2]]
-                self.geometry.check_pose(goal)
-                if not self.session.validate_target(goal,deadline):
-                    raise BaseAlignmentRequired(error)
-                self.move('align_tool',goal,deadline)
-                corrections+=1
-                aligned.clear()
-                until=min(deadline,time.monotonic()+8.)
-        except TimeoutError as exc:
-            raise GeometryUnavailable('fresh cup and target depth unavailable before descent') from exc
-        raise GeometryUnavailable('cannot observe a stable cup and target depth before descent')
-
-    def fresh_target(self, object_id, deadline):
-        while time.monotonic()<deadline:
+    def confirm_empty(self, scene, deadline):
+        if self.held is not None or self.session is None or self.session.pump_may_be_on:
+            return False
+        until = min(deadline, time.monotonic() + float(self.config.get('observation_timeout', 5.)))
+        while time.monotonic() < until:
             self.ensure()
-            scene=self.fresh_scene(deadline)
-            target=next((d for d in scene.detections if d.object_id==object_id),None)
-            if target is not None:
-                return target
-        raise TimeoutError('selected physical object not observed in a fresh scene')
+            if scene is not None and (self.scene_id is None or scene.scene_id == self.scene_id):
+                age = time.monotonic() - scene.observed_at
+                hand = scene.manipulation.get('gripper', {})
+                if (scene.observed_at >= self.observed_after
+                        and 0 <= age <= float(self.config.get('observation_max_age', 2.))
+                        and hand.get('state') == 'empty' and hand.get('evidence')):
+                    return True
+            try:
+                scene = self.fresh_scene(until)
+            except TimeoutError:
+                break
+        return False
 
-    def observe_hand(self,scene):
-        hand=scene.manipulation.get('gripper',{})
-        if (scene.observed_at>=self.observed_after and hand.get('state')=='empty'
-                and bool(hand.get('evidence')) and self.held is None):
-            self.empty_seen=True
+    def unreachable_pick(self, context, reason):
+        empty = self.confirm_empty(self.last_scene, context.deadline)
+        return ActionResult(context, Outcome.UNREACHABLE if empty else Outcome.UNKNOWN, str(reason))
+
+    @staticmethod
+    def observed_target(scene, object_id, label):
+        return next((d for d in scene.detections if d.object_id == object_id and d.label == label), None)
+
+    @staticmethod
+    def observed_empty_for(scene, object_id):
+        hand = scene.manipulation.get('gripper', {})
+        return hand.get('state') == 'empty' and bool(hand.get('evidence')) and hand.get('object_id') == object_id
+
+    def payload_at_cup(self, scene, point):
+        return (self.matches_observed_cup(scene,point)
+                and not self.observed_empty_for(scene,self.held))
+
+    @staticmethod
+    def raised_payload(scene, object_id):
+        raised = scene.manipulation.get('raised_payload') or {}
+        point = raised.get('point_arm_mm')
+        if (raised.get('object_id') == object_id and isinstance(point, (list, tuple))
+                and len(point) == 3 and all(math.isfinite(v) for v in point)):
+            return raised
+        return None
+
+    def _refresh_hold(self, scene):
+        """Return hold evidence from this frame, preserving state through occlusion."""
+        if (self.held is None or scene is None or scene.scene_id != self.scene_id
+                or scene.observed_at < self.observed_after
+                or scene.observed_at < self.last_hold_seen):
+            return False
+        if self.observed_empty_for(scene, self.held):
+            raise RuntimeError('gripper visibly empty while carrying; preserve suction and stop travel')
+        target = self.observed_target(scene, self.held, self.held_label)
+        supported = self.raised_payload(scene, self.held) is not None
+        if not supported and target is not None:
+            try:
+                supported = self.payload_at_cup(scene, self.geometry.payload_point(target))
+            except GeometryUnavailable:
+                pass
+        if supported:
+            self.last_hold_seen = max(self.last_hold_seen, scene.observed_at)
+        return supported
+
+    def _wait_for_holding(self, deadline):
+        until = min(deadline, time.monotonic()+float(self.config.get('feedback_timeout',15.)))
+        while not self._refresh_hold(self.fresh_scene(until)):
+            pass
+
+    def target_on_support(self, scene, object_id, point, original_top):
+        tolerance = float(self.geometry.values.get('holding_position_tolerance_mm',25.))
+        if math.dist(point,original_top)>tolerance:
+            return False
+        if self.observed_empty_for(scene,object_id):
+            return True
+        if not self.config.get('stationary_ordinary_test'):
+            return False
+        cup = self.observed_cup(scene)
+        hand = scene.manipulation.get('gripper', {})
+        # The held object cannot simultaneously be at the original support
+        # and separated from an observed cup with visible free space below it.
+        return (cup is not None and cup[2]-point[2]>tolerance
+                and hand.get('object_id')==object_id and hand.get('occupied_rays')==0
+                and hand.get('free_rays',0)>=int(self.geometry.values.get('gripper_min_rays',30)))
 
     def _confirm_pick(self,target,top_before,lift,deadline):
         held_votes=empty_votes=0
-        needed=int(self.config.get('manipulation_confirm_frames',2))
-        tolerance=float(self.geometry.values.get('holding_position_tolerance_mm',25.))
+        needed=self.confirm_frames
         while time.monotonic()<deadline:
-            current=self.fresh_target(target.object_id,deadline)
+            scene=self.fresh_scene(deadline)
+            raised = self.raised_payload(scene, target.object_id)
+            if raised and not self.observed_empty_for(scene, target.object_id):
+                point = raised['point_arm_mm']
+                if point[2] >= top_before[2] + lift*.5:
+                    held_votes += 1
+                    empty_votes = 0
+                    if held_votes >= needed:
+                        self.event('holding_depth_evidence', object_id=target.object_id,
+                                   contact_top_mm=point, support_pixels=raised['support_pixels'])
+                        return True, point
+                    continue
+            current=self.observed_target(scene,target.object_id,target.label)
+            if current is None:
+                held_votes=empty_votes=0
+                continue
             try:point=self.geometry.payload_point(current)
             except GeometryUnavailable:
                 held_votes=empty_votes=0;continue
-            scene=self.last_scene
             held=(point[2]>=top_before[2]+lift*.5 and self.matches_observed_cup(scene,point))
-            # Gripper empty is positive depth visibility, not missing detection.
-            hand=scene.manipulation.get('gripper',{})
-            empty=(hand.get('state')=='empty' and bool(hand.get('evidence'))
-                   and hand.get('object_id')==target.object_id and math.dist(point,top_before)<=tolerance)
-            held_votes=held_votes+1 if held else 0
-            empty_votes=empty_votes+1 if empty else 0
+            hand_empty=self.observed_empty_for(scene,target.object_id)
+            empty=self.target_on_support(scene,target.object_id,point,top_before)
+            held_votes=held_votes+1 if held and not hand_empty else 0
+            empty_votes=empty_votes+1 if empty and not held else 0
             if held_votes>=needed:return True,point
             if empty_votes>=needed:return False,point
         raise TimeoutError('neither held nor positively empty observed')
 
-    def _wait_target(self, object_id, deadline, predicate):
-        votes=0;required=int(self.config.get('manipulation_confirm_frames',2))
+    def _wait_target(self, object_id, deadline, predicate, *, point_of=None, stable_mm=None):
+        votes=0;required=self.confirm_frames
+        point_of = point_of or self.geometry.payload_point
+        anchor=None
         while time.monotonic()<deadline:
-            target=self.fresh_target(object_id,deadline)
+            scene=self.fresh_scene(deadline)
+            target=self.observed_target(scene,object_id,self.held_label)
+            if target is None:
+                votes=0;anchor=None
+                continue
             try:
-                point=self.geometry.payload_point(target)
+                point=point_of(target)
             except GeometryUnavailable:
-                votes=0;continue
-            votes=votes+1 if predicate(target,point) else 0
+                votes=0;anchor=None;continue
+            if not predicate(target,point):
+                votes=0;anchor=None
+                continue
+            if stable_mm is not None and (anchor is None or math.dist(point,anchor)>stable_mm):
+                votes=0;anchor=point
+            votes+=1
             if votes>=required:
                 return target,point
         raise TimeoutError('fresh visual manipulation evidence did not converge')
 
-    def pick(self, target, label, context, _alignment_round=0):
-        self.open();self.ensure()
-        self.version=max(self.version,context.scene_version)
-        self.selected_target=target
+    def pick(self, target, label, context, *, scene, return_to_support=False):
+        self.open()
+        self.ensure()
         if self.held is not None or self.session.pump_may_be_on:
-            return ActionResult(context,Outcome.UNKNOWN,'hand is not established empty before a new pick')
-        try:
-            target=self.fresh_target(target.object_id,context.deadline)
-            approach=float(self.geometry.values.get('approach_offset_mm',40.))
-            lift=float(self.geometry.values.get('lift_offset_mm',50.))
-            remaining_adjustments=max(0,int(self.config.get('max_base_alignments',2))-_alignment_round)
-            for index in range(remaining_adjustments+1):
-                dx,dy=self.geometry.base_adjustment(target)
-                candidate=self.geometry.contact(target)
-                if math.hypot(dx,dy)<=1. and self.reachable_grasp(candidate,approach,lift,context.deadline):
-                    break
-                if index>=remaining_adjustments:
-                    raise GeometryUnavailable('no reachable grasp from the stopped pickup station')
-                if math.hypot(dx,dy)<=1.:
-                    choices=sorted(((x,y) for x in (-100.,-75.,-50.,-25.,0.,25.,50.,75.,100.)
-                        for y in (-75.,-50.,-25.,0.,25.,50.,75.) if 0<math.hypot(x,y)<=100.),key=lambda p:math.hypot(*p))
-                    choice=next(((x,y) for x,y in choices if self.reachable_grasp(
-                        [candidate[0]-x,candidate[1]-y,candidate[2]],approach,lift,context.deadline)),None)
-                    if choice is None:raise GeometryUnavailable('no controller-reachable approach/contact/lift after a local base adjustment')
-                    dx,dy=choice
-                if math.hypot(dx,dy)>float(self.config.get('max_base_adjustment_mm',100.)):
-                    raise GeometryUnavailable('target remains outside the reliable work area')
-                report=self.align_base(dx,dy,context,_alignment_round)
-                _alignment_round+=1
-                self.event('base_align',report=report)
-                if not report['passed']:
-                    return ActionResult(context,Outcome.FAILED,'base alignment failed: '+json.dumps(report))
-                self.observed_after=time.monotonic()
-                target=self.fresh_target(target.object_id,context.deadline)
-            contact=self.geometry.contact(target)
-            top_before=self.geometry.point(target)
-            _,projection=self.geometry.grasp_projection(target)
-            self.event('grasp_projection',object_id=target.object_id,contact_command_mm=contact,
-                       **projection)
-        except GeometryUnavailable as exc:
-            outcome=Outcome.UNREACHABLE if self.empty_seen else Outcome.UNKNOWN
-            return ActionResult(context,outcome,str(exc))
-        approach=float(self.geometry.values.get('approach_offset_mm',40.))
-        lift=float(self.geometry.values.get('lift_offset_mm',50.))
-        self.active('pick',target)
-        self.move('approach',[contact[0],contact[1],contact[2]+approach],context.deadline)
-        if self.geometry.values.get('require_visual_alignment',False):
+            return ActionResult(context, Outcome.UNKNOWN, 'hand is not established empty before a new pick')
+        if (scene.version != context.scene_version or target not in scene.detections
+                or target.object_id != context.object_id or target.label != label
+                or (self.scene_id is not None and scene.scene_id != self.scene_id)):
+            return ActionResult(context, Outcome.UNKNOWN, 'pickup target does not match the stopped camera frame')
+        self.scene_id, self.last_scene, self.version = scene.scene_id, scene, scene.version
+        if target.graspable is not True or target.occluded_by:
+            return ActionResult(context, Outcome.UNREACHABLE, 'no unobstructed top in the stopped camera frame')
+
+        approach = float(self.geometry.values.get('approach_offset_mm', 40.))
+        lift = float(self.geometry.values.get('lift_offset_mm', 50.))
+        forward = float(self.config.get('stationary_forward_correction_mm', 0.))
+        if self.geometry.values.get('grasp_xy_source') == 'official-planar':
+            forward = 0.
+        if not math.isfinite(approach) or approach <= 0. or not math.isfinite(lift) or lift <= 0.:
+            return ActionResult(context, Outcome.UNREACHABLE, 'invalid approach or lift height')
+        correction = (0., 0., 0.)
+        cup = self.observed_cup(scene)
+        if cup is not None and self.geometry.values.get('grasp_xy_source', 'dlt') == 'dlt':
+            reference = (*cup[:2], cup[2]+self.geometry.cup_offset)
+            offset = [measured-observed for measured,observed in zip(self.arm_pose,reference)]
+            if math.hypot(*offset) <= float(self.geometry.values.get('max_visual_correction_mm', 30.)):
+                correction = offset
+
+        # All candidate points come from the same stopped RGB-D frame.
+        for option in self.geometry.pickup_options(target):
             try:
-                contact=self.align_tool(target,context.deadline)
-                self.geometry.check_pose(contact)
-                if not self.reachable_grasp(contact,self.arm_pose[2]-contact[2],lift,context.deadline):
-                    raise GeometryUnavailable('visually corrected approach/contact/lift is outside controller reach')
-            except BaseAlignmentRequired as exc:
-                self.move('empty_travel',self.geometry.values['empty_travel_pose_mm'],context.deadline)
-                if _alignment_round>=int(self.config.get('max_base_alignments',2)) or math.hypot(*exc.error)>100.:
-                    return ActionResult(context,Outcome.UNREACHABLE if self.empty_seen else Outcome.UNKNOWN,str(exc))
-                report=self.align_base(exc.error[0],exc.error[1],context,_alignment_round)
-                self.event('visual_base_align',report=report,measured_error_mm=exc.error)
-                if not report['passed']:return ActionResult(context,Outcome.FAILED,'visual base adjustment failed: '+json.dumps(report))
-                self.observation('objects',context.deadline)
-                return self.pick(target,label,context,_alignment_round+1)
+                projection = self.geometry.grasp_projection(option)
+                if math.hypot(*self.geometry.base_adjustment(option, projection=projection)) > 1.:
+                    continue
+                nominal = self.geometry.contact_target(option, projection=projection)
+                adjusted = [v+d for v,d in zip(nominal,correction)]
+                adjusted[0] += forward
+                contact = self.geometry.check_pose(adjusted, pickup_label=label)
+                hover = self.geometry.check_pose([*contact[:2],contact[2]+approach], pickup_label=label)
+                lift_target = self.geometry.check_pose([*contact[:2],contact[2]+lift], pickup_label=label)
             except GeometryUnavailable as exc:
-                self.observation('objects',context.deadline)
-                return ActionResult(context,Outcome.UNREACHABLE if self.empty_seen else Outcome.UNKNOWN,str(exc))
-        self.move('contact',contact,context.deadline)
-        self.session.pump(True,deadline=context.deadline)
-        self.empty_seen=False
+                self.event('pickup_candidate_rejected', object_id=option.object_id, reason=str(exc))
+                continue
+            for phase, pose in (('approach', hover), ('contact', contact), ('lift', lift_target)):
+                if not self.session.validate_target(pose, context.deadline):
+                    self.event('pickup_candidate_rejected', object_id=option.object_id,
+                               reason='controller rejected target', stage=phase, target_mm=pose)
+                    break
+            else:
+                break
+        else:
+            return ActionResult(context, Outcome.UNREACHABLE, 'no grasp point within the arm workspace in the stopped frame')
+
+        top_before = self.geometry.point(target)
+        target = self.selected_target = option
+        self.grasp_camera_offset = correction
+        self.event('first_frame_grasp_plan', object_id=target.object_id, scene_version=scene.version,
+                   source_stamp=scene.source_stamp, selected_source=self.geometry.values.get('grasp_xy_source', 'dlt'),
+                   grasp_pixel=target.surface.get('grasp_pixel'),
+                   top_arm_mm=self.geometry.point(target), support_arm_z_mm=target.surface.get('support_z_mm'),
+                   nominal_contact_mm=nominal, reference_offset_mm=correction,
+                   official_model=projection[1].get('official_model'),
+                   stationary_forward_correction_mm=forward,
+                   hover_mm=hover, contact_mm=contact, lift_mm=lift_target)
+        self.active('pick', target)
+        self.move('approach', hover, context.deadline, target_prevalidated=True)
+        self.session.pump(True, deadline=context.deadline, wait_for_current=False)
+        self.move('contact', contact, context.deadline, target_prevalidated=True)
+        lift_from = list(self.arm_pose)
         self.held=target.object_id  # possible holding until image evidence settles it
         self.held_label=label
-        self.move('lift',[contact[0],contact[1],contact[2]+lift],context.deadline,loaded=True)
-        if self.geometry.values.get('hold_observation_pose_mm'):
-            self.move('hold_view',self.geometry.values['hold_observation_pose_mm'],context.deadline,loaded=True)
+        # Keep the lift vertical at the measured contact XY.
+        measured_lift = [*lift_from[:2], lift_from[2]+lift]
+        self.move('lift', measured_lift, context.deadline, loaded=True,
+                  target_prevalidated=measured_lift == lift_target)
+        hold_pose = self.geometry.values.get('hold_observation_pose_mm')
+        if hold_pose:
+            self.move('hold_view',hold_pose,context.deadline,loaded=True)
+        feedback_timeout = float(self.config.get('feedback_timeout',15.))
         try:
             held,point=self._confirm_pick(target,top_before,lift,min(context.deadline,
-                time.monotonic()+float(self.config.get('feedback_timeout',15.))))
+                time.monotonic()+feedback_timeout))
         except TimeoutError:
             return ActionResult(context,Outcome.UNKNOWN,'pump may hold an object; lift not visually confirmed')
-        if not held:
+        if held is False:
             self.session.pump(False,deadline=context.deadline)
-            self.held=None;self.held_label='';self.empty_seen=True
-            self.observation('objects',context.deadline)
+            self.held=None;self.held_label=''
+            self.observe_objects()
             return ActionResult(context,Outcome.NOT_ACQUIRED,'selected target stayed on support; gripper volume visibly empty')
-        self.last_hold_seen=time.monotonic()
+        if held:
+            self.last_hold_seen = self.last_scene.observed_at
+        if return_to_support:
+            self.event('holding_confirmed',object_id=target.object_id,observed_top_mm=point)
+            if hold_pose:
+                self.move('static_return_above',lift_target,context.deadline,loaded=True)
+            self.move('static_return_contact',lift_from,context.deadline,loaded=True)
+            self.session.pump(False,deadline=context.deadline)
+            self.move('verify_placement',lift_target,context.deadline)
+            self._wait_target(target.object_id,context.deadline,lambda d,p:
+                self.target_on_support(self.last_scene,target.object_id,p,top_before),stable_mm=5.)
+            self.event('returned_to_support',object_id=target.object_id)
+            self.held=None;self.held_label=''
+            self.observe_objects()
+            return ActionResult(context,Outcome.CONFIRMED,'measured lift, visual hold and return to original support confirmed')
         self.move('transport',self.geometry.values['transport_pose_mm'],context.deadline,loaded=True)
         self.active('carrying',target)
-        self._wait_target(target.object_id,min(context.deadline,time.monotonic()+
-            float(self.config.get('feedback_timeout',15.))),lambda d,p:
-            self.matches_observed_cup(self.last_scene,p))
-        self.last_hold_seen=time.monotonic()
         self.event('holding_confirmed',object_id=target.object_id,observed_top_mm=point)
         return ActionResult(context,Outcome.CONFIRMED,'fresh top motion matches measured cup lift: '+target.object_id)
 
     def check_carrying(self, scene):
         if self.held is None:
             return
-        target=next((d for d in scene.detections if d.object_id==self.held),None) if scene else None
-        if target is not None:
-            try:
-                point=self.geometry.payload_point(target)
-                if self.matches_observed_cup(scene,point):
-                    self.last_hold_seen=scene.observed_at
-            except GeometryUnavailable:
-                pass
-        if time.monotonic()-self.last_hold_seen>float(self.config.get('holding_observation_timeout',2.)):
-            raise RuntimeError('holding observation lost or stale; preserve suction and stop travel')
+        camera_at = max(self.last_hold_seen, scene.observed_at if scene is not None
+                        and scene.scene_id == self.scene_id else 0.)
+        if time.monotonic()-camera_at > float(self.config.get('holding_observation_timeout',2.)):
+            raise RuntimeError('RGB-D stream expired while carrying; preserve suction and stop travel')
+        self._refresh_hold(scene)
 
     def drop(self, zone, label, context):
-        if self.held!=context.object_id:
+        if self.held!=context.object_id or self.held_label!=label:
             return ActionResult(context,Outcome.UNKNOWN,'placement does not match the held object')
         slot=self.slots.get(zone,0)
-        region=None;polygon=None
+        region=None;polygon=None;above=None
         landing_kind='collection'
         self.zone=zone
         if self.geometry.values.get('placement_mode')=='visual_red_zone':
             self.observed_after=time.monotonic();self.active('observe_placement')
             until=min(context.deadline,time.monotonic()+8.);placement=None
             while time.monotonic()<until:
-                scene=self.fresh_scene(until);candidate=scene.manipulation.get('placement')
-                if candidate and candidate.get('zone')==zone and candidate.get('candidates_arm_mm'):
-                    placement=candidate;break
+                try:
+                    scene = self.fresh_scene(until)
+                except TimeoutError:
+                    break
+                holding = self._refresh_hold(scene)
+                candidate = scene.manipulation.get('placement')
+                if holding and candidate and candidate.get('zone') == zone and candidate.get('candidates_arm_mm'):
+                    placement = candidate
+                    break
+            if self.last_hold_seen < self.observed_after:
+                return ActionResult(context, Outcome.UNKNOWN, 'no fresh holding evidence at the release station')
             if placement is None:
                 if zone=='A' or not self.config.get('allow_transport_zone_fallback',False):
                     return ActionResult(context,Outcome.UNKNOWN,'no observed reachable free floor in the destination red zone')
@@ -444,37 +516,55 @@ class SerialMissionRuntime:
                 landing_kind='transport'
                 self.event('transport_fallback_plan',zone=zone,release_mm=release,recorded_region=region)
             else:
+                polygon=placement.get('polygon_arm_mm')
+                if (not isinstance(polygon, (list, tuple)) or len(polygon)<3
+                        or any(not isinstance(p, (list, tuple)) or len(p)!=2
+                               or not all(type(v) in (int, float) and math.isfinite(v) for v in p)
+                               for p in polygon)):
+                    return ActionResult(context,Outcome.UNKNOWN,'no valid observed destination polygon')
                 support=float(placement['support_z_mm'])
                 height=float(self.geometry.values.get('object_height_mm',{}).get(label,100.))
                 z=support+height+float(self.geometry.values.get('release_bottom_clearance_mm',100.))+self.geometry.cup_offset
-                release=next(([p[0],p[1],z] for p in placement['candidates_arm_mm'] if
-                    self.session.validate_target([p[0],p[1],z],context.deadline) and
-                    self.session.validate_target([p[0],p[1],max(z+40.,self.arm_pose[2])],context.deadline)),None)
+                release=None
+                for x,y,*_ in placement['candidates_arm_mm']:
+                    candidate=[x,y,z]
+                    approach=[x,y,max(z+40.,self.arm_pose[2])]
+                    if (self.session.validate_target(candidate,context.deadline) and
+                            self.session.validate_target(approach,context.deadline)):
+                        release,above=candidate,approach
+                        break
                 if release is None:
                     if zone=='A' or not self.config.get('allow_transport_zone_fallback',False):
                         return ActionResult(context,Outcome.UNKNOWN,'observed red zone is outside the arm reach')
                     try:release,region,support=self.geometry.transport_release(zone,label,slot)
                     except GeometryUnavailable as exc:return ActionResult(context,Outcome.UNKNOWN,str(exc))
                     landing_kind='transport'
+                    polygon=None
                     self.event('transport_fallback_plan',zone=zone,release_mm=release,recorded_region=region)
                 else:
-                    polygon=placement['polygon_arm_mm']
                     region=[min(p[0] for p in polygon),max(p[0] for p in polygon),min(p[1] for p in polygon),max(p[1] for p in polygon)]
                     self.event('visual_release_plan',zone=zone,release_mm=release,observed_region=placement)
         else:
+            self.observed_after = time.monotonic()
+            self._wait_for_holding(context.deadline)
             release=self.geometry.release(zone,label,slot)
             support=float(self.geometry.values.get('drop_support_z_mm',{}).get(zone,self.geometry.support_z))
-        above=[release[0],release[1],max(release[2]+40.,self.arm_pose[2])]
+        region=region or self.geometry.values.get('drop_regions_arm_mm',{}).get(zone)
+        if (not isinstance(region, (list, tuple)) or len(region)!=4
+                or not all(type(v) in (int, float) and math.isfinite(v) for v in region)
+                or region[0]>=region[1] or region[2]>=region[3] or not math.isfinite(support)):
+            return ActionResult(context,Outcome.UNKNOWN,'no measured placement region for '+zone)
+        if above is None:
+            above=[release[0],release[1],max(release[2]+40.,self.arm_pose[2])]
+            if not all(self.session.validate_target(point,context.deadline) for point in (release,above)):
+                return ActionResult(context,Outcome.UNKNOWN,'destination is outside the arm reach')
         self.active('place')
-        self.move('place_approach',above,context.deadline,loaded=True)
-        self.move('release_height',release,context.deadline,loaded=True)
+        self.move('place_approach',above,context.deadline,loaded=True,target_prevalidated=True)
+        self.move('release_height',release,context.deadline,loaded=True,target_prevalidated=True)
         self.session.pump(False,deadline=context.deadline)
-        self.move('withdraw',above,context.deadline)
+        self.move('withdraw',above,context.deadline,target_prevalidated=True)
         self.active('verify_placement')
         height=float(self.geometry.values.get('object_height_mm',{}).get(label,100.))
-        region=region or self.geometry.values.get('drop_regions_arm_mm',{}).get(zone)
-        if not region or len(region)!=4:
-            return ActionResult(context,Outcome.UNKNOWN,'released, but no measured placement region for '+zone)
         tolerance=float(self.geometry.values.get('height_tolerance_mm',12.))
         landing_margin=math.sqrt(2)*float(self.geometry.values.get('object_width_mm',{}).get(label,100.))/2.
         def inside(p):
@@ -490,13 +580,13 @@ class SerialMissionRuntime:
                 float(self.config.get('feedback_timeout',15.))),lambda d,p:
                 inside(p)
                 and abs(p[2]-(support+height))<=tolerance
-                and math.dist(p,[self.arm_pose[0],self.arm_pose[1],self.arm_pose[2]-self.geometry.cup_offset])>self.geometry.cup_radius)
+                and self.observed_empty_for(self.last_scene,context.object_id),
+                point_of=lambda d:self.geometry.point(d,require_fit=False),stable_mm=tolerance)
         except TimeoutError:
             return ActionResult(context,Outcome.UNKNOWN,'release commanded; correct final region not observed')
         self.held=None;self.held_label='';self.selected_target=None
         self.zone=None
-        self.empty_seen=True;self.slots[zone]=slot+1
-        self.move('empty_travel',self.geometry.values['empty_travel_pose_mm'],context.deadline)
+        self.slots[zone]=slot+1
         self.active('empty')
         self.event('placement_confirmed',object_id=context.object_id,zone=zone,slot=slot,point_mm=point,
                    landing_kind=landing_kind)
@@ -507,42 +597,68 @@ class SerialMissionRuntime:
         import rospy
         from cv_bridge import CvBridge
         from sensor_msgs.msg import Image
-        from suat_mission.vision.board_recognition import BoardGeometry, BoardReader, DirectionEvidence
+        from suat_mission.vision.board_recognition import BoardDecision
+        from suat_mission.vision.board_station_view import station_views, visible_board_view
+        from suat_mission.vision.mission_overlay import MissionOverlay, draw_board
+        from suat_mission.vision.perception import OBJECTS
         from suat_mission.vision.template_matcher import TemplateMatcher
-        geometry_file = self.config['board_geometry_file']
-        if station == 'Classification_area__recorded_reference':
-            geometry_file = self.config.get('board_reference_geometry_file', geometry_file)
-        data=json.loads(Path(geometry_file).read_text(encoding='utf-8'))
-        geometry=BoardGeometry(tuple(data['image_size']),data['corners'],tuple(data['normalized_size']),data['geometry_id'])
-        direction=DirectionEvidence(run_id,geometry.geometry_id,'fixed_reference',data['direction_reference'],
-                                    tuple(data['zones']),data.get('direction_confirmed') is True)
-        reader=BoardReader(run_id,geometry,direction,started_ns=rospy.Time.now().to_nsec(),
-            min_votes=int(self.config.get('board_votes',3)),threshold=float(self.config.get('board_min_confidence',.6)))
-        templates={n:[cv2.imread(str(self.root/'src/suat_mission/assets/templates'/(n+'.png')))]
-                   for n in ('clock','teddybear','banana')}
-        matcher=TemplateMatcher(templates,scales=[.4,.5,.6,.7,.8,.9,1.,1.1,1.2],threshold=.6,max_peaks=8)
-        images_dir = self.run/'board'/station
-        images_dir.mkdir(parents=True, exist_ok=True)
-        bridge=CvBridge();last=reader.started_ns;rows=[]
-        deadline=min(time.monotonic()+float(self.config.get('board_timeout',20.)),
-                     float(self.config.get('_deadline',float('inf'))))
-        while len(rows)<int(self.config.get('board_frames',5)) and time.monotonic()<deadline:
+
+        geometry_file, _, views = station_views(self.config, station)
+        start = rospy.Time.now().to_nsec()
+        deadline = min(time.monotonic() + float(self.config.get('board_timeout', 12.)),
+                       float(self.config.get('_deadline', float('inf'))))
+        topic = self.config.get('board_image_topic', '/camera/color/image_raw')
+        bridge = CvBridge()
+        overlay = MissionOverlay('board', bridge, draw_board)
+        directory = self.run / 'board' / station
+        directory.mkdir(parents=True, exist_ok=True)
+        zones = ('B', 'C', 'D')
+        templates = {label: [cv2.imread(str(self.root/'src/suat_mission/assets/templates'/(label+'.png')))]
+                     for label in OBJECTS}
+        matcher = TemplateMatcher(templates, scales=[.4,.5,.6,.7,.8,.9,1.,1.1,1.2],
+                                  threshold=float(self.config.get('board_min_confidence', .6)), max_peaks=8)
+        evidence = dict(run_id=run_id, station=station, geometry_file=str(geometry_file),
+                        direction_source='fixed_reference', slot_order=list(zones))
+        last_view = None
+        mapping = {}
+        while time.monotonic() < deadline and not mapping:
             self.ensure()
-            msg=rospy.wait_for_message(self.config.get('board_image_topic','/camera/color/image_raw'),Image,timeout=3)
-            stamp=msg.header.stamp.to_nsec()
-            if stamp<=last:continue
-            last=stamp;image=bridge.imgmsg_to_cv2(msg,'bgr8')
-            matches=matcher.detect_board(geometry.normalize(image));detections=matches.pop('detections')
-            image_file=images_dir/('frame_%02d.png'%len(rows))
-            name=str(image_file.relative_to(self.run))
-            if not cv2.imwrite(str(image_file),image):raise RuntimeError('cannot save board image')
-            decision=reader.observe(detections,coordinate_space='normalized_board',run_id=run_id,
-                stamp_ns=stamp,now_ns=rospy.Time.now().to_nsec(),frame_id=msg.header.frame_id,image_id=name)
-            rows.append({'stamp_ns':stamp,'image':name,'accepted':decision.accepted})
-        result=reader.result(now_ns=rospy.Time.now().to_nsec())
-        self.event('board_result',station=station,geometry_file=geometry_file,
-                   accepted=result.accepted,reason=result.reason,mapping=dict(result.mapping),frames=rows)
-        return result
+            try:
+                msg = rospy.wait_for_message(topic, Image, timeout=max(.01, deadline-time.monotonic()))
+            except rospy.ROSException:
+                break
+            stamp = msg.header.stamp.to_nsec()
+            if stamp <= start:
+                continue
+            image = bridge.imgmsg_to_cv2(msg, 'bgr8')
+            if tuple(image.shape[1::-1]) != views[0].image_size:
+                continue
+            visible = visible_board_view(image, views[0])
+            for view in ([visible] if visible is not None else views):
+                detections = matcher.detect_board(view.normalize(image))['detections']
+                slots = {}
+                for detection in sorted(detections, key=lambda item: item.score, reverse=True):
+                    slot = int(3*detection.x/view.normalized_size[0])
+                    if 0 <= slot < len(zones):
+                        slots.setdefault(slot, detection)
+                last_view = (msg, image, view, tuple(slots.values()), stamp, visible is not None)
+                if {item.label for item in slots.values()} == set(OBJECTS):
+                    mapping = {slots[i].label: zone for i, zone in enumerate(zones)}
+                    break
+
+        accepted = bool(mapping)
+        reason = 'accepted' if accepted else 'board_not_read'
+        if last_view is not None:
+            msg, image, view, detections, stamp, observed = last_view
+            image_file = directory / 'board_frame.png'
+            cv2.imwrite(str(image_file), image)
+            evidence.update(image=str(image_file.relative_to(self.run)), stamp_ns=stamp,
+                            selected_geometry_id=view.geometry_id, geometry=view.evidence(),
+                            geometry_source='visible_outline' if observed else 'recorded_reference')
+            overlay.render(msg, image, view, (), detections, zones, reason, mapping,
+                           'Fixed slots: B | C | D', save=directory / 'mission_overlay.png')
+        self.event('board_result', accepted=accepted, reason=reason, mapping=mapping, **evidence)
+        return BoardDecision(accepted, reason, mapping, evidence)
 
     def close(self):
         if self.active_pub is not None:

@@ -1,0 +1,33 @@
+<?xml version="1.0"?>
+<launch>
+  <!-- B 线生产相机适配：同步 RGB + 对齐深度 + CameraInfo，输出正式观测话题。
+       只读，不发运动/机械臂/吸泵命令；正式入口由 A 线把它连同 mission.launch 一起接入。 -->
+  <arg name="start_camera" default="false"/>
+  <arg name="config" default="$(find suat_mission)/config/field_perception.yaml"/>
+  <arg name="evidence_dir" default=""/>
+
+  <group if="$(arg start_camera)">
+    <include file="$(find realsense2_camera)/launch/rs_camera.launch">
+      <arg name="enable_color" value="true"/>
+      <arg name="enable_depth" value="true"/>
+      <arg name="align_depth" value="true"/>
+      <arg name="enable_infra" value="false"/>
+      <arg name="enable_infra1" value="false"/>
+      <arg name="enable_infra2" value="false"/>
+      <arg name="enable_pointcloud" value="false"/>
+      <arg name="publish_tf" value="false"/>
+      <arg name="publish_odom_tf" value="false"/>
+      <arg name="color_width" value="640"/>
+      <arg name="color_height" value="480"/>
+      <arg name="color_fps" value="30"/>
+      <arg name="depth_width" value="640"/>
+      <arg name="depth_height" value="480"/>
+      <arg name="depth_fps" value="30"/>
+    </include>
+  </group>
+
+  <node pkg="suat_mission" type="field_perception_node.py" name="suat_field_perception" output="screen" required="false">
+    <rosparam command="load" file="$(arg config)"/>
+    <param name="evidence_dir" value="$(arg evidence_dir)"/>
+  </node>
+</launch>

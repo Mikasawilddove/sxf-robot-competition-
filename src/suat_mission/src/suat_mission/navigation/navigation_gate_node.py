@@ -20,12 +20,15 @@ from sensor_msgs.msg import LaserScan
 from std_msgs.msg import String
 from std_srvs.srv import Trigger, TriggerResponse
 
-from suat_mission.navigation.navigation_gate import NavigationGate, navigation_clients_fault, motion_bounds_fault
+from suat_mission.navigation.navigation_gate import (
+    NavigationGate, blocked_footprint_cell, goal_is_free, motion_bounds_fault, navigation_clients_fault,
+)
+from suat_mission.navigation.path_tracker import BRAKING_LATENCY_S, PathTracker, braking_arc, braking_speed
 from suat_mission.navigation.navigation_map import load_binding, verify_map
-from suat_mission.navigation.pickup_keepout import PLANNING_MAP_TOPIC, PickupKeepout
+from suat_mission.navigation.pickup_keepout import KEEP_OUT_FILE, PLANNING_MAP_TOPIC, PickupKeepout
 from suat_mission.navigation.navigation_profiles import speed_profile, path_travel_fault
 from suat_mission.navigation.corner_egress import (
-    DISTANCE, SPEED, SweepBlocked, anchor_check, check_rear_clearance,
+    DISTANCE, SweepBlocked, anchor_check, check_rear_clearance,
     map_departure, scan_departure, sweep_observation_gap, contact_path,
 )
 
@@ -35,6 +38,7 @@ SHORT_ECHO_M = .15
 ECHO_RECHECK_TIMEOUT_S = 1.5
 ECHO_RECHECK_SETTLE_S = .15
 ECHO_RECHECK_CLEAR_SCANS = 3
+TERMINAL_RECHECK_TIMEOUT_S = 1.5
 
 
 class Node:
@@ -52,6 +56,7 @@ class Node:
         if self.mode=='short' and self.speed_name!='slow':raise ValueError('short mode requires slow speed')
         speed=speed_profile(self.speed_name)
         self.egress_accel=speed['accel_linear']
+        self.speed=speed
         self.gate = NavigationGate(speed['linear'],speed['angular'],180. if self.mode=='field' else 60.)
         self.travel=0.
         self.previous_odom_pose=None
@@ -73,22 +78,25 @@ class Node:
         self.binding = load_binding(Path(rospy.get_param('~workspace_root')))
         self.workspace_root = Path(rospy.get_param('~workspace_root'))
         self.keepout = None
+        self.keepout_file = rospy.get_param('~keepout_file',KEEP_OUT_FILE)
         self.planning_map_pub = None
-        self.map_xy = None
+        self.map_xy = self.map_pose = None
+        self.route = None
         if rospy.get_param('~mission_keepout',False):
-            self.keepout = PickupKeepout.load(self.workspace_root,self.binding)
+            self.keepout = PickupKeepout.load(self.workspace_root,self.binding,self.keepout_file)
             self.keepout_radius = float(rospy.get_param('/move_base/global_costmap/robot_radius',.20)) + float(
                 rospy.get_param('/move_base/global_costmap/footprint_padding',.02))
             if not math.isfinite(self.keepout_radius) or self.keepout_radius<=0:
                 raise ValueError('invalid footprint radius for central pickup keepout')
             self.planning_map_pub = rospy.Publisher(PLANNING_MAP_TOPIC,OccupancyGrid,queue_size=1,latch=True)
         self.profile = rospy.get_param('~profile', 'UNKNOWN')
+        self.path_control = self.profile == 'field_path'
+        if self.path_control and (self.speed_name != 'fast' or self.mode != 'field'):
+            raise ValueError('the field path controller uses the fixed fast profile')
         self.buffer = tf2_ros.Buffer()
         self.listener = tf2_ros.TransformListener(self.buffer)
         self.state_pub = rospy.Publisher('/suat/navigation/state', String, queue_size=1, latch=True)
         self.subs = [
-            rospy.Subscriber('/suat/navigation/raw_cmd_vel', Twist, self.command, 'raw', queue_size=1),
-            rospy.Subscriber('/suat/navigation/smoothed_cmd_vel', Twist, self.command, 'smooth', queue_size=1),
             rospy.Subscriber('/suat/navigation/heartbeat', String, self.heartbeat, queue_size=1),
             rospy.Subscriber('/scan', LaserScan, self.on_scan, queue_size=1),
             rospy.Subscriber('/odom', Odometry, self.on_odom, queue_size=1),
@@ -96,7 +104,12 @@ class Node:
             rospy.Subscriber('/move_base/local_costmap/costmap', OccupancyGrid, self.on_local_map, queue_size=1),
             rospy.Subscriber('/move_base/local_costmap/costmap_updates', OccupancyGridUpdate, self.on_local_update, queue_size=1),
             rospy.Subscriber('/move_base/status', GoalStatusArray, self.on_goals, queue_size=1)]
+        if not self.path_control:
+            self.subs.extend([
+                rospy.Subscriber('/suat/navigation/raw_cmd_vel', Twist, self.command, 'raw', queue_size=1),
+                rospy.Subscriber('/suat/navigation/smoothed_cmd_vel', Twist, self.command, 'smooth', queue_size=1)])
         self.services = [rospy.Service('~arm', Trigger, self.arm),
+                         rospy.Service('~follow_path', Trigger, self.follow_path),
                          rospy.Service('~stop', Trigger, self.stop),
                          rospy.Service('~release', Trigger, self.release),
                          rospy.Service('~begin_a_egress', Trigger, self.begin_a_egress)]
@@ -200,7 +213,10 @@ class Node:
                     self.graph_at = self.tf_at = time.monotonic()
                     self.tf_fault = fault
                     p=transform.transform.translation
+                    q=transform.transform.rotation
+                    yaw=math.atan2(2*(q.w*q.z+q.x*q.y),1-2*(q.y*q.y+q.z*q.z))
                     self.map_xy=(p.x,p.y)
+                    self.map_pose=(p.x,p.y,yaw)
             except Exception:
                 pass  # The output thread stops on monitor expiry even if this thread blocks.
             self.stopping.wait(.1)
@@ -215,10 +231,11 @@ class Node:
             return 'other_cmd_vel_publishers:' + ','.join(others)
         if '/spark_base_server' not in subs.get('/cmd_vel', []):
             return 'base_driver_not_subscribed'
-        if pubs.get('/suat/navigation/raw_cmd_vel', []) != ['/move_base']:
-            return 'raw_navigation_owner_mismatch'
-        if pubs.get('/suat/navigation/smoothed_cmd_vel', []) != ['/suat_navigation_nodelet_manager']:
-            return 'smoother_owner_mismatch'
+        if not self.path_control:
+            if pubs.get('/suat/navigation/raw_cmd_vel', []) != ['/move_base']:
+                return 'raw_navigation_owner_mismatch'
+            if pubs.get('/suat/navigation/smoothed_cmd_vel', []) != ['/suat_navigation_nodelet_manager']:
+                return 'smoother_owner_mismatch'
         if pubs.get('/map', []) != ['/map_server'] or self.map_fault:
             return self.map_fault or 'map_owner_mismatch'
         if self.keepout is not None and (pubs.get(PLANNING_MAP_TOPIC,[]) != [rospy.get_name()]
@@ -238,7 +255,7 @@ class Node:
             return self.tf_fault or 'TF_check_expired'
         if self.goals is None or now-self.goals[0] > 1.0:
             return 'move_base_status_expired'
-        if require_idle and self.goals[1]:
+        if (require_idle or self.path_control) and self.goals[1]:
             return 'existing_active_goal'
         if require_still and (self.still_since is None or now-self.still_since < .5):
             return 'base_not_stationary'
@@ -247,6 +264,8 @@ class Node:
     def inputs_clear(self):
         # A fresh stack has no previous command to drain. After its first lease,
         # retain independently observed raw/smoothed zeros through the handoff.
+        if self.path_control:
+            return True
         if not self.has_armed:
             return all(values is None or all(abs(value)<=1e-8 for value in values)
                        for values in self.input_samples.values())
@@ -260,13 +279,10 @@ class Node:
         with self.lock:
             was_disarmed = self.gate.state == 'DISARMED'
             try:
-                if not self.owner_request(request):raise ValueError('only configured navigation owner may arm')
+                if self.path_control or not self.owner_request(request):
+                    raise ValueError('external velocity input is disabled for this navigation owner/profile')
                 if not self.inputs_clear():raise ValueError('previous navigation inputs are not zero')
-                caps=None
-                if self.owner=='/suat_mission' and rospy.get_param('~station_approach',False) is True:
-                    approach=speed_profile('slow')
-                    caps=(approach['linear'],approach['angular'])
-                token = self.gate.arm(time.monotonic(), self.health(True, True),caps=caps)
+                token = self.gate.arm(time.monotonic(), self.health(True, True))
                 self.start_odom_pose = self.odom[5:8]
                 self.previous_odom_pose=self.start_odom_pose
                 self.travel=0.
@@ -333,7 +349,7 @@ class Node:
         with self.lock:
             started_here=False
             try:
-                if self.mode!='field' or not self.owner_request(request):
+                if self.path_control or self.mode!='field' or not self.owner_request(request):
                     raise ValueError('only the field owner may start A departure')
                 if not self.inputs_clear():raise ValueError('previous navigation inputs are not zero')
                 fault=self.health(True,True)
@@ -417,6 +433,196 @@ class Node:
                 if started_here and self.pub is not None:
                     self.pub.publish(Twist());self.pub.unregister();self.pub=None
                 return TriggerResponse(False,str(exc))
+
+    def follow_path(self, request):
+        with self.lock:
+            try:
+                if not self.path_control or not self.owner_request(request):
+                    raise ValueError('only the field path owner can start a route')
+                fault=self.health(True,True)
+                if fault:
+                    raise ValueError(fault)
+                if self.gate.state!='DISARMED':
+                    raise ValueError('previous route has not released control')
+                spec=rospy.get_param('~route_request')
+                points,goal=spec['points'],spec['goal']
+                xy,angle=spec['xy_tolerance'],spec['yaw_tolerance']
+                if (not 1<=len(points)<=2000 or len(goal)!=3
+                        or any(len(p)!=2 or not all(math.isfinite(v) for v in p) for p in points)
+                        or not all(math.isfinite(v) for v in goal)
+                        or not .005<=xy<=.08 or not .04<=angle<=.15
+                        or math.dist(points[-1],goal[:2])>1e-5
+                        or math.dist(points[0],self.map_pose[:2])>.035
+                        or sum(math.dist(a,b) for a,b in zip(points,points[1:]))>8.):
+                    raise ValueError('invalid or stale verified navigation path')
+                now=time.monotonic()
+                if self.local_grid is None or now-self.local_grid_at>1.5:
+                    raise ValueError('live local costmap unavailable')
+                radius=float(rospy.get_param('/move_base/global_costmap/robot_radius',.20))+float(
+                    rospy.get_param('/move_base/global_costmap/footprint_padding',.02))
+                if not math.isfinite(radius) or radius<=0:
+                    raise ValueError('invalid competition footprint')
+                origin=self.map_pose
+                odom=self.odom[5:8]
+                contact_end=None
+                walls={}
+                reference=None
+                if not goal_is_free(self.map_grid,*origin[:2],radius=radius):
+                    contact_end=spec['contact_end']
+                    if len(contact_end)!=2 or math.dist(origin[:2],contact_end)>.65:
+                        raise ValueError('no bounded contact prefix')
+                    proof=contact_path(self.map_grid,origin,[contact_end],radius,_cache=walls)
+                    if not proof['escaped_initial_overlap']:
+                        raise ValueError('path prefix does not clear original wall contact')
+                    mg=self.map_grid
+                    g=self.local_grid
+                    ox,oy=g['origin']; r=g['resolution']
+                    cells=set()
+                    for i,j in walls['walls']:
+                        point=(mg['origin'][0]+(i+.5)*mg['resolution'],
+                               mg['origin'][1]+(j+.5)*mg['resolution'])
+                        x,y=self.local_point(point,origin,odom)
+                        cells.add((math.floor((x-ox)/r),math.floor((y-oy)/r)))
+                    reference=(ox,oy,r,cells)
+                    contact_path(g,self.local_point(origin,origin,odom),
+                                 [self.local_point(contact_end,origin,odom)],radius,
+                                 reference,static_contact=True)
+                tracker=PathTracker(points,goal[2],xy,angle,self.speed,contact_end)
+                token=self.gate.arm(now)
+                try:
+                    self.pub=rospy.Publisher('/cmd_vel',Twist,queue_size=1,latch=False)
+                except Exception:
+                    self.gate.stop('output_publisher_creation_failed')
+                    raise
+                self.start_odom_pose=self.previous_odom_pose=odom
+                self.travel=0.
+                self.route={'id':uuid.uuid4().hex,'status':'ACTIVE','error':None,'at':now,
+                            'tracker':tracker,'radius':radius,'origin':origin,'odom_origin':odom,
+                            'walls':walls,'reference':reference,'local_frame':self.local_frame,
+                            'contact':contact_end is not None,'moving':False,'peak_mps':0.,
+                            'reversals':0,'last_turn':0}
+                return TriggerResponse(True,json.dumps({'token':token,'route_id':self.route['id']}))
+            except Exception as exc:
+                return TriggerResponse(False,str(exc))
+
+    def local_point(self, point, map_pose, odom_pose):
+        if self.local_frame=='map':
+            return tuple(point[:2])
+        dx,dy=point[0]-map_pose[0],point[1]-map_pose[1]
+        rotation=odom_pose[2]-map_pose[2]
+        c,s=math.cos(rotation),math.sin(rotation)
+        return (odom_pose[0]+c*dx-s*dy,odom_pose[1]+s*dx+c*dy)
+
+    def terminal_clearance_wait(self, route, block, now):
+        tracker=route['tracker']
+        hold=route.get('terminal_recheck')
+        if block is not None:
+            route['blocked_footprint']=block
+            if (not tracker.position_reached or block['source']!='live_costmap'
+                    or block['value']!=100 or (hold is not None and hold['resumed'])):
+                raise ValueError('path footprint blocked in '+block['source'])
+            if hold is None:
+                hold=route['terminal_recheck']={'started':now,'resumed':False}
+            hold.update(clear_updates=0,grid_at=self.local_grid_at)
+        if hold is None or hold['resumed']:
+            return False
+        if now-hold['started']>=TERMINAL_RECHECK_TIMEOUT_S:
+            raise ValueError('terminal footprint did not clear while stopped')
+        if (block is None and self.local_grid_at>hold['grid_at']
+                and self.still_since is not None and self.local_grid_at>=self.still_since
+                and self.local_grid_at>hold['started']):
+            hold['grid_at']=self.local_grid_at
+            hold['clear_updates']+=1
+            if hold['clear_updates']>=2:
+                hold['resumed']=True
+        tracker.v=tracker.w=0.
+        return True
+
+    def preview_terminal_speed(self, pose, odom, v, w, radius):
+        """Slow the commanded arc while there is still room to brake."""
+        previous=pose[:2]
+        for point in braking_arc(pose,v,w,self.egress_accel,latency=2*BRAKING_LATENCY_S):
+            local=self.local_point(point,pose,odom)
+            if (not goal_is_free(self.local_grid,*local,radius=radius)
+                    or not goal_is_free(self.map_grid,*point,radius=radius)
+                    or (self.keepout is not None and not self.keepout.segment_clear(previous,point,radius))):
+                return min(v,braking_speed(math.dist(pose[:2],previous),self.egress_accel))
+            previous=point
+        return v
+
+    def route_output(self, now):
+        route=self.route
+        if not route or route['status']!='ACTIVE':
+            return 0.,0.
+        try:
+            fault=self.health()
+            if self.gate.state!='ARMED' or fault:
+                raise ValueError(fault or self.gate.reason)
+            if self.gate.sequence<0:
+                return self.gate.departure_output(now,0.)
+            if (self.local_grid is None or self.local_frame!=route['local_frame']
+                    or now-self.local_grid_at>1.5):
+                raise ValueError('live local costmap expired')
+            pose=self.map_pose
+            odom=self.odom[5:8]
+            radius=route['radius']
+            local=self.local_point(pose,pose,odom)
+            route['contact'] = route['contact'] and (
+                not goal_is_free(self.map_grid,*pose[:2],radius=radius)
+                or not goal_is_free(self.local_grid,*local,radius=radius))
+            tracker=route['tracker']
+            measured_v,measured_w=self.odom[3:5]
+            dt=min(.10,now-route['at'])
+            route['at']=now
+            v,w=tracker.command(pose,measured_w,dt,route['contact'],measured_v=measured_v)
+            if v>0. and tracker.near_goal and not route['contact']:
+                v=tracker.v=self.preview_terminal_speed(pose,odom,v,w,radius)
+            # Check the commanded and measured braking arcs against both maps.
+            # The original contact reference expires as soon as the body clears.
+            block=None
+            for arc_source,speed,turn in (('commanded',v,w),('measured',measured_v,measured_w)):
+                arc=braking_arc(pose,speed,turn,self.egress_accel)
+                local_arc=[self.local_point(point,pose,odom) for point in arc]
+                if route['contact']:
+                    contact_path(self.map_grid,route['origin'],[pose,*arc],radius,_cache=route['walls'])
+                    contact_path(self.local_grid,self.local_point(route['origin'],route['origin'],route['odom_origin']),
+                                 [local,*local_arc],radius,route['reference'],static_contact=True,
+                                 _cache=route.setdefault('local_walls',{}))
+                else:
+                    maps=(('saved_map',self.map_grid,[pose,*arc]),('live_costmap',self.local_grid,[local,*local_arc]))
+                    for source,grid,path in maps:
+                        for point in path:
+                            cell=blocked_footprint_cell(grid,*point[:2],radius)
+                            if cell is not None:
+                                cell.update(source=source,arc=arc_source,point_xy=list(point[:2]),
+                                            pose_map=list(pose),linear_mps=speed,angular_radps=turn)
+                                if (block is None or source=='saved_map'
+                                        or (block['source']!='saved_map' and cell['value']!=100)):
+                                    block=cell
+                                break
+                if self.keepout is not None and any(not self.keepout.segment_clear(a,b,radius)
+                        for a,b in zip([pose,*arc],arc)):
+                    raise ValueError('planned motion enters central pickup keepout')
+            if self.terminal_clearance_wait(route,block,now):
+                return self.gate.departure_output(now,0.)
+            if tracker.arrived(pose,measured_v,measured_w):
+                route['status']='COMPLETED'
+                self.gate.stop('path_arrived')
+                return 0.,0.
+            v,w=self.gate.departure_output(now,v,angular=w)
+            if self.gate.state=='ARMED':
+                self.gate.reason='field_path'
+            route['moving']|=abs(v)>0. or abs(w)>0.
+            route['peak_mps']=max(route['peak_mps'],abs(measured_v))
+            if abs(measured_w)>.05:
+                sign=1 if measured_w>0. else -1
+                route['reversals']+=int(route['last_turn']==-sign)
+                route['last_turn']=sign
+            return v,w
+        except Exception as exc:
+            route.update(status='FAILED',error=str(exc))
+            self.gate.stop('field_path_blocked')
+            return 0.,0.
 
     def pause_for_near_echo(self, state, blocks, now, scan_pose):
         scan_stamp = self.scan[1]
@@ -519,8 +725,9 @@ class Node:
                 contact_path(self.map_grid,state['map_origin'],
                     [[tr.translation.x,tr.translation.y],state['target_map'][:2]],state['radius'])
                 error=math.atan2(math.sin(math.atan2(dy,dx)-yaw),math.cos(math.atan2(dy,dx)-yaw))
-                state['command_w']=max(-.30,min(.30,1.2*error))
-                desired=0. if abs(error)>.15 else min(SPEED,.8*remaining)
+                turn_limit = self.gate.MAX_W
+                state['command_w']=max(-turn_limit,min(turn_limit,1.2*error))
+                desired=0. if abs(error)>.15 else min(self.gate.MAX_V,.8*remaining)
                 dt=max(0.,min(.1,now-state['command_at']))
                 state['command_v']=min(desired,state['command_v']+self.egress_accel*dt)
                 state['command_at']=now
@@ -565,7 +772,7 @@ class Node:
             if not self.echo_hold_cleared(state, now, scan_pose, remaining):
                 return
             dt=max(0.,min(.1,now-state['command_at']))
-            state['command_v']=min(SPEED,state['command_v']+self.egress_accel*dt)
+            state['command_v']=min(self.gate.MAX_V,.8*remaining,state['command_v']+self.egress_accel*dt)
             state['command_at']=now
         except Exception as exc:
             state.update(status='FAILED',error=str(exc));self.gate.stop('a_egress_blocked')
@@ -591,12 +798,15 @@ class Node:
         count = 0
         while not self.stopping.wait(.05) and not rospy.is_shutdown():
             with self.lock:
-                self.update_a_egress(time.monotonic())
-                if self.egress and self.egress['status'] in ('WAIT_HEARTBEAT','ACTIVE'):
-                    v,w=self.gate.departure_output(time.monotonic(),self.egress['command_v'],self.health(),angular=self.egress.get('command_w',0.))
+                if self.path_control:
+                    v,w=self.route_output(time.monotonic())
                 else:
-                    v,w=self.gate.output(time.monotonic(), self.health())
-                if self.keepout is not None and self.gate.state=='ARMED' and self.map_xy is not None:
+                    self.update_a_egress(time.monotonic())
+                    if self.egress and self.egress['status'] in ('WAIT_HEARTBEAT','ACTIVE'):
+                        v,w=self.gate.departure_output(time.monotonic(),self.egress['command_v'],self.health(),angular=self.egress.get('command_w',0.))
+                    else:
+                        v,w=self.gate.output(time.monotonic(), self.health())
+                if not self.path_control and self.keepout is not None and self.gate.state=='ARMED' and self.map_xy is not None:
                     # The swept center stays within this radius for the next
                     # output/TF cycle and the configured braking distance.
                     speed=max(abs(v),abs(self.odom[3]))
@@ -617,9 +827,14 @@ class Node:
                         'profile': self.profile,
                         'mode':self.mode,'speed_profile':self.speed_name,'travel_m':self.travel,
                         'owner':self.owner,'inputs_clear':self.inputs_clear(),
+                        'workspace_root':str(Path(__file__).resolve().parents[5]),
                         'mission_keepout':self.keepout is not None,
+                        'keepout_file':self.keepout_file,
                         'active_goal':None if self.goals is None else self.goals[1],
-                        'health': self.health(), 'egress':None if self.egress is None else {
+                        'health': self.health(), 'route': None if self.route is None else {
+                            key:self.route.get(key) for key in ('id','status','error','moving','peak_mps','reversals',
+                                'blocked_footprint','terminal_recheck')},
+                        'egress':None if self.egress is None else {
                             'id':self.egress['id'], 'status':self.egress['status'], 'distance_m':self.egress['distance'],
                              'error':self.egress['error'],
                              'path_prefix_target_map':self.egress.get('target_map'),

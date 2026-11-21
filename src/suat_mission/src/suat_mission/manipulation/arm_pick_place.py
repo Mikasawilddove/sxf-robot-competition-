@@ -3,7 +3,7 @@
 """完整抓取流水线：开机初始位 -> 观察 -> 识别 -> 垂直抓取 -> 垂直抬升
 -> 带着方块摆到最左 -> 扫桌面避让放置。
 
-对应现场反馈的三条硬约束：
+动作顺序：
 
 1) 抓起并抬升到位后，默认执行「自动避让放置」：带着方块把关节1 转到最左，
    相机（固定在高处）拍一帧把桌面所有 100mm 方块都框出来，挑一块不压到
@@ -11,17 +11,13 @@
    想恢复旧行为（抓起后原样带回初始位）用 --no-place；
    想放到固定坐标用 --place-at；想叠到指定名称的方块上用 --place-on。
 
-2) 抓取后的抬升是纯 z 抬升。x、y 在整个抬升过程一个数值都不改，
-   收臂（改 x/y）只能发生在到达抬升高度之后。
-   而且必须小步慢抬：一步 100mm 地跳，方块会被惯性甩掉。
+2) 吸附等待结束后，以带载速度发送一条固定 XY 的垂直起提指令。
+   随后的收臂和转运也受 --feed-loaded 限速。此入口使用估算等待时间。
 
 3) 流程首尾都在开机初始位，跑完随时可以再跑一遍。
 
-4) 给相机让视野时**只转关节1**：绕基座把手转到最左（90°），半径和高度
-   全程不变，大臂小臂姿态一个角都不动。不能靠平移 y 去"摆到一边"，
-   那样半径变了，看起来是伸出去够东西，还会扫过方块正上方挡住镜头。
-   转向直接用一条 G0 给终点，不拆段：起点终点半径、高度都相同，
-   固件插补出来就是绕基座的弧线，不分段反而更快、也没有分段累积误差。
+4) 给相机让视野时在指定高度改变方位。指令指定笛卡尔终点，
+   实际关节轨迹由固件插补决定。
 
 几何模型（cam_point = A @ arm_point + B）来自现场 8 点 DLT 拟合，
 参数从场地标定文件读取，源码里不留数值：
@@ -50,6 +46,10 @@ from cv_bridge import CvBridge
 from sensor_msgs.msg import Image
 from swiftpro.msg import position, status
 from suat_mission.manipulation.official_calibration import load_profile, project_top
+from suat_mission.manipulation.arm_path import (
+    FEED_APPROACH, FEED_FAST, FEED_LOADED, speed_of, travel_dwell, vertical_lift_points,
+)
+from suat_mission.vision.experimental_vision import ExperimentalVision, TEMPLATE_FILES, measure_layer
 
 # --- 标定参数：全部从场地标定文件读，源码里不留 DLT 数值 --------------------
 #
@@ -302,12 +302,7 @@ def load_calibration(files=None, use_camera_info=True, verbose=True):
 # 固件不认名义进给率：F10000 标称 167mm/s，实机只有 44mm/s。
 # 实测把 F 提到 80000 能跑到 95mm/s，再往上（150000）反而回落到 80，
 # 说明 80000 就是固件的饱和点。
-FEED_FAST = 80000.0   # 长距离平移、转关节、回初始位
-FEED_SLOW = 40000.0   # 贴到方块那一下、刚吸住后的初段抬升
-
-# F 值 -> 实测速度(mm/s)，用于估算等待时间。
-# 中间线性插值，超过最高档按最高档算。想提速就调 FEED_FAST，不要超过 80000。
-FEED_SPEED_TABLE = [(0.0, 20.0), (10000.0, 44.3), (40000.0, 78.7), (80000.0, 95.4)]
+FEED_SLOW = FEED_APPROACH
 
 # 转关节时末端走的是弧线，实测比直线快：r=200 转 90°（弧长 314mm）
 # 正向 2.46s、反向 2.76s，等效 114~128mm/s。用直线那套 95mm/s 估会多等一秒多。
@@ -320,17 +315,6 @@ DWELL_MIN = 0.45      # 再短的动作也要给这一点
 DWELL_STEP = 1.2      # 分段走时每段的等待（兼容旧调用）
 DWELL_LONG = 1.6
 
-
-def speed_of(feed):
-    """把 F 值折算成实测速度 mm/s（分段线性插值）。"""
-    pts = FEED_SPEED_TABLE
-    if feed <= pts[0][0]:
-        return pts[0][1]
-    for (f1, s1), (f2, s2) in zip(pts, pts[1:]):
-        if feed <= f2:
-            k = (feed - f1) / float(f2 - f1)
-            return s1 + (s2 - s1) * k
-    return pts[-1][1]
 
 # 在观察位和方块正上方之间水平移动时保持的高度，必须高于方块顶面
 SAFE_Z = 70.0
@@ -404,73 +388,68 @@ def ground_baseline(depth):
 
 
 def rise_map(depth):
-    """整幅「比地面高多少毫米」的图，无效深度置 NaN。
+    """Estimate candidate support plane in 3D and signed heights in mm.
 
-    地面是平的，但相机有俯仰，所以地面在图上越靠上越远 —— 这是透视不是斜面。
-    逐行取深度中位数连成一条基线，基线减实测深度就是凸起量：
-    地面≈0，一层方块顶面≈10cm，叠到第二层≈20cm。
-
-    深度空洞（白面反光打不出散斑）在这里置成 NaN，不参与中位数，
-    否则 depth=0 会被算成「比地面高几百毫米」的假凸起。
+    A dominant plane is a candidate, not a guarantee that it is the physical
+    support surface. The action lock remains until geometry is verified.
     """
-    coef = ground_baseline(depth)
-    if coef is None:
+    if depth is None or not isinstance(depth, np.ndarray) or depth.ndim != 2:
         return None
-    rows = np.arange(depth.shape[0])
-    expected = np.polyval(coef, rows)[:, None]
-    rise = expected - depth.astype(np.float32)
-    rise[depth <= 0] = np.nan
-    return rise
-
-
-def measure_layer(rise, box, layer_rise=110.0, block_h=100.0, tol=0.45):
-    """判断这个方块的顶面在第几层，返回 (layer, rise_mm)。
-
-    只看框上部那一条：这一条是顶面，rise 在顶面上是常数；
-    再往下是竖直侧面，rise 从 0 渐变到顶面高度，混进来会把中位数拉低。
-
-    取值的办法是「先找众数，再在众数附近求中位数」，不用整体中位数：
-    机械臂本身离相机很近（rise 几百毫米），从方块旁边经过时
-    会占掉这条带子的很大一块，整体中位数会被它拖到几百毫米，
-    实测把桌面层的 cake 判成了第 3 层。
-
-    判据用「相对一层的实测凸起量」而不是绝对 100mm：
-    相机是斜着看的，竖直 100mm 在深度上只会变成 rise≈110mm，
-    而且这个系数跟镜头俯仰角绑死。用比例判定，
-    一层 110、两层 220，差一倍，比绝对阈值稳得多。
-    """
-    if rise is None:
-        return 0, None
-    x, y, w, h = box
-    x0, y0 = max(0, int(x)), max(0, int(y))
-    x1 = min(rise.shape[1], x0 + int(w))
-    y1 = min(rise.shape[0], y0 + int(h))
-    if x1 - x0 < 4 or y1 - y0 < 4:
-        return 0, None
-    bh = y1 - y0
-    band = rise[y0 + int(0.05 * bh):y0 + max(int(0.05 * bh) + 4, int(0.45 * bh)),
-                x0:x1]
-    good = band[~np.isnan(band)]
-    # 机械臂、手爪这些近处物体的 rise 是几百甚至上千，先按物理上限切掉。
-    # 上限 = 三层半，再高的只能是别的东西。
-    good = good[(good > -60.0) & (good < 3.5 * max(layer_rise, 1.0) / 1.1)]
-    if good.size < 10:
-        return 0, None
-    edges = np.arange(-60.0, 3.5 * layer_rise + 20.0, 20.0)
-    hist, _ = np.histogram(good, bins=edges)
-    peak = float((edges[int(np.argmax(hist))] + edges[int(np.argmax(hist)) + 1]) / 2.0)
-    near = good[np.abs(good - peak) < 30.0]
-    value = float(np.median(near)) if near.size >= 5 else peak
-    layer = int(round(value / max(layer_rise, 1.0))) - 1
-    layer = max(0, min(3, layer))
-    want = (layer + 1) * layer_rise
-    if abs(value - want) > tol * layer_rise:
-        print('    顶面凸起 %.0fmm 与第 %d 层(应 %.0fmm)差得多，按最近的层处理'
-              % (value, layer, want), flush=True)
-    if layer * block_h > 250.0:
-        print('    层数异常(%d)，按地面层处理' % layer, flush=True)
-        layer = 0
-    return layer, value
+    if not all(np.isfinite(v) for v in (FX, FY, CX, CY)) or FX <= 0 or FY <= 0:
+        return None
+    height, width = depth.shape
+    if height < 40 or width < 40:
+        return None
+    stride = max(2, min(height, width) // 120)
+    vv, uu = np.mgrid[0:height:stride, 0:width:stride]
+    zz = depth[::stride, ::stride].astype(np.float64)
+    valid = np.isfinite(zz) & (zz > 300.0) & (zz < 1500.0)
+    u, v, z = uu[valid], vv[valid], zz[valid]
+    if z.size < 500:
+        print('[plane] insufficient valid depth', flush=True)
+        return None
+    px, py, pz = (u-CX)*z/FX, (v-CY)*z/FY, z
+    points = np.column_stack((px, py, pz))
+    rng = np.random.RandomState(17)
+    best_count, best_normal, best_d = 0, None, None
+    for _ in range(220):
+        a, b, c = points[rng.choice(len(points), 3, replace=False)]
+        normal = np.cross(b-a, c-a)
+        mag = np.linalg.norm(normal)
+        if mag < 1e-8:
+            continue
+        normal /= mag
+        offset = -float(np.dot(normal, a))
+        if offset < 0:
+            normal, offset = -normal, -offset
+        residual = np.abs(normal[0]*px + normal[1]*py + normal[2]*pz + offset)
+        count = int(np.count_nonzero(residual <= 6.0))
+        if count > best_count:
+            best_count, best_normal, best_d = count, normal, offset
+    if best_normal is None or best_count < max(400, int(0.30 * len(points))):
+        print('[plane] no sufficiently supported plane', flush=True)
+        return None
+    residual = np.abs(best_normal[0]*px + best_normal[1]*py + best_normal[2]*pz + best_d)
+    keep = residual <= 6.0
+    # Insist that the plane appears over a broad part of the image.
+    if np.ptp(u[keep]) < width*0.4 or np.ptp(v[keep]) < height*0.3:
+        print('[plane] reference surface lacks spatial coverage', flush=True)
+        return None
+    support = points[keep]
+    center = support.mean(axis=0)
+    covariance = (support-center).T @ (support-center) / len(support)
+    _, eigvec = np.linalg.eigh(covariance)
+    normal = eigvec[:,0]
+    offset = -float(np.dot(normal,center))
+    if offset < 0:
+        normal, offset = -normal, -offset
+    yy, xx = np.indices(depth.shape, dtype=np.float32)
+    dd = depth.astype(np.float32)
+    result = dd * (normal[0]*(xx-CX)/FX + normal[1]*(yy-CY)/FY + normal[2]) + offset
+    result[~np.isfinite(dd) | (dd <= 0)] = np.nan
+    print('[plane] candidate support %.1f%%, normal %s' %
+          (100.0 * best_count / len(points), np.array2string(normal, precision=3)), flush=True)
+    return result.astype(np.float32)
 
 
 def find_block(colour, depth, min_area=2500):
@@ -484,14 +463,9 @@ def find_block(colour, depth, min_area=2500):
 
     机械臂自己离相机近得多，凸起量在 200mm 以上，会自然被上限排除。
     """
-    coef = ground_baseline(depth)
-    if coef is None:
+    rise = rise_map(depth)
+    if rise is None:
         return None, np.zeros_like(depth, np.uint8)
-    rows = np.arange(depth.shape[0])
-    expected = np.polyval(coef, rows)[:, None]
-    rise = expected - depth.astype(np.float32)
-
-    # ±45mm 的余量覆盖方块高度 100mm 和噪声；上限 150mm 排除近处机械臂
     mask = ((rise > 35) & (rise < 150) & (depth > 0)).astype(np.uint8) * 255
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((13, 13), np.uint8))
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((9, 9), np.uint8))
@@ -541,13 +515,6 @@ def find_block(colour, depth, min_area=2500):
         best['depth'] = int(depth[int(best['v']), int(best['u'])])
     return best, mask
 
-
-TEMPLATE_FILES = {
-    'banana': ['banana.png'],
-    'cake': ['cake.png', 'cake_rule_reference.png'],
-    'clock': ['clock.png'],
-    'teddybear': ['teddybear.png'],
-}
 
 _SMALL_TEMPLATES = None
 
@@ -611,12 +578,9 @@ def find_all_blocks(colour, depth, min_area=2000):
 
     判据和 find_block 完全一致：逐行地面基线 + 凸起量 35~150mm + 形状过滤。
     """
-    coef = ground_baseline(depth)
-    if coef is None:
+    rise = rise_map(depth)
+    if rise is None:
         return [], np.zeros_like(depth, np.uint8)
-    rows = np.arange(depth.shape[0])
-    expected = np.polyval(coef, rows)[:, None]
-    rise = expected - depth.astype(np.float32)
     mask = ((rise > 35) & (rise < 150) & (depth > 0)).astype(np.uint8) * 255
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((13, 13), np.uint8))
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((9, 9), np.uint8))
@@ -651,21 +615,10 @@ def named_vision():
     if _VISION is not None:
         return _VISION
     import rospkg
-    from suat_mission.vision.experimental_vision import ExperimentalVision
 
     base = os.path.join(rospkg.RosPack().get_path('suat_mission'),
                         'assets', 'templates')
-    templates = {}
-    for label, files in TEMPLATE_FILES.items():
-        images = []
-        for name in files:
-            path = os.path.join(base, name)
-            image = cv2.imread(path)
-            if image is None or not image.size:
-                raise RuntimeError('模板读取失败: %s' % path)
-            images.append(image)
-        templates[label] = images
-    _VISION = ExperimentalVision(templates, banana_saturation_min=55)
+    _VISION = ExperimentalVision.from_template_directory(base)
     return _VISION
 
 
@@ -694,20 +647,6 @@ def _top_face_uv(box, depth):
     return x0 + float(xs.mean()), y0 + float(ys.mean())
 
 
-def _enhance(image, clip=3.0, scale=2.0):
-    """对比度增强 + 放大。
-
-    白底浅色图案的方块（典型是时钟）角点又少又弱，原图上只能匹配到
-    8~9 个点，单应算出来的四边形会略微塌陷，被凸性检查筛掉。
-    CLAHE 拉一下亮度对比度再放大 2 倍，特征点就够了。
-    """
-    lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
-    l, a, b = cv2.split(lab)
-    l = cv2.createCLAHE(clipLimit=clip, tileGridSize=(8, 8)).apply(l)
-    out = cv2.cvtColor(cv2.merge([l, a, b]), cv2.COLOR_LAB2BGR)
-    return cv2.resize(out, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
-
-
 def find_named_block(colour, depth, target, min_score=0.45, min_hits=1):
     """识别画面里所有方块，挑出名字等于 target 的那一个。
 
@@ -718,25 +657,7 @@ def find_named_block(colour, depth, target, min_score=0.45, min_hits=1):
     min_hits 是「目标至少要找到几个」。要叠同名方块时必须给 2 ——
     只找到一个的话，抓起来桌上就没得放了。数量不够会自动走增强重识别。
     """
-    vision = named_vision()
-    found = [d for d in vision.detect(colour) if d.score >= min_score]
-
-    hits = [d for d in found if d.label == target]
-    if len(hits) < min_hits:
-        # 原图漏检时用增强图重试。时钟是白底浅灰，原图上常常只提得出几个角点，
-        # 一个框都框不全，更别说两个。CLAHE 拉对比度 + 放大 2 倍能补回来。
-        from suat_mission.vision.perception import Detection
-        big = _enhance(colour)
-        scaled = [d for d in vision.detect(big) if d.score >= min_score]
-        if scaled:
-            scaled = [Detection(d.label, d.score, d.x / 2.0, d.y / 2.0,
-                                d.width / 2.0, d.height / 2.0) for d in scaled]
-            new_hits = [d for d in scaled if d.label == target]
-            print('    原图只找到 %d 个 %s，增强后 %d 个'
-                  % (len(hits), target, len(new_hits)), flush=True)
-            if len(new_hits) > len(hits):
-                found = scaled
-                hits = new_hits
+    found = named_vision().detect_for_target(colour, target, min_score, min_hits)
 
     mask = np.zeros(depth.shape, np.uint8)
     for d in found:
@@ -773,12 +694,15 @@ def find_named_block(colour, depth, target, min_score=0.45, min_hits=1):
 class Arm(object):
     """所有运动都走这里，保证「垂直」就是真的垂直。"""
 
-    def __init__(self, settle=1.5):
+    def __init__(self, settle=1.5, loaded_feed=FEED_LOADED):
         self.pos = rospy.Publisher('/position_write_topic', position, queue_size=1)
         self.st = rospy.Publisher('/swiftpro_status_topic', status, queue_size=1)
         self.pump = rospy.Publisher('/pump_topic', status, queue_size=1)
         time.sleep(settle)
         self.cur = None
+        self.loaded_feed = loaded_feed
+        # 控制状态，仅用于限速。开泵不代表已抓住，关泵不代表已脱离。
+        self.vacuum_requested = False
 
     def attach(self):
         # M17 上力。只在流程开始时发一次：每步都重发会让运动执行错乱
@@ -791,18 +715,11 @@ class Arm(object):
     def set_feed(self, feed):
         """切换骨架速度。驱动每次回调都实时读这个参数，下一条指令立即生效。
 
-        只在速度真的变了才写参数：写参数是同步 RPC，能保证返回时
-        参数服务器已经更新，那驱动下一条回调读到的就一定是新值。
+        写参数是同步 RPC，成功后才发布位置指令。
         """
         feed = float(feed)
-        if abs(getattr(self, '_feed', 0.0) - feed) < 1.0:
-            return
-        try:
-            rospy.set_param('/swiftpro/feedrate', feed)
-            self._feed = feed
-            time.sleep(0.05)
-        except Exception as exc:
-            print('    设置速度失败（保持原值）：%s' % exc, flush=True)
+        # 驱动在收到位置消息时读这个参数。写失败就停止，避免沿用上一档。
+        rospy.set_param('/swiftpro/feedrate', feed)
 
     def _dwell_for(self, dist, feed):
         """按实测速度模型算等待时间，代替写死的 3.2s。
@@ -810,21 +727,26 @@ class Arm(object):
         宁可稍长也不要短：等短了会在机械臂还在动的时候就发下一条，
         抓取时会把方块刮歪。
         """
-        return max(DWELL_MIN, dist / max(speed_of(feed), 1.0) + DWELL_PAD)
+        return travel_dwell(dist, feed)
 
     def goto(self, x, y, z, dwell=None, tag='', feed=None):
         if feed is None:
             feed = FEED_FAST
+        if self.vacuum_requested:
+            feed = min(feed, self.loaded_feed)
         x, y, z = float(x), float(y), float(z)
         if self.cur is not None:
             dist = math.sqrt((x - self.cur[0]) ** 2 + (y - self.cur[1]) ** 2
                              + (z - self.cur[2]) ** 2)
         else:
             dist = 120.0          # 不知道当前位置时按中等行程估
+        estimated = self._dwell_for(dist, feed)
         if dwell is None:
-            dwell = self._dwell_for(dist, feed)
+            dwell = estimated
+        elif self.vacuum_requested:
+            dwell = max(dwell, estimated)
         print('[机械臂] 当前步骤：%s' % (tag or '移动'), flush=True)
-        print('[机械臂] 目标位置：(%.1f, %.1f, %.1f) mm' % (x, y, z), flush=True)
+        print('[机械臂] 目标位置：(%.1f, %.1f, %.1f) mm  F%.0f' % (x, y, z, feed), flush=True)
         print('[机械臂] 目标姿态：当前接口仅控制 XYZ；参考坐标系：arm_base；坐标单位：毫米', flush=True)
         self.set_feed(feed)
         self.pos.publish(position(x, y, z))
@@ -842,6 +764,10 @@ class Arm(object):
         G0 本身就是笛卡尔指令，一次到位比拆成几段更准，
         分段反而每段都要重新起停、累积误差。
         """
+        if not (math.isfinite(z_to) and math.isfinite(z_from) and z_to <= z_from):
+            raise ValueError('下降终点必须低于或等于起点')
+        if z_from == z_to:
+            return
         if feed is None:
             feed = FEED_SLOW
         if step <= 0:
@@ -856,39 +782,37 @@ class Arm(object):
         """原地抬升：x、y 全程不变，只有 z 在动。step <= 0 时一条指令直达。"""
         if feed is None:
             feed = FEED_SLOW
-        if step <= 0:
-            self.goto(x, y, z_to, dwell=dwell, feed=feed)
-            return
-        z = z_from
-        while z < z_to:
-            z = min(z_to, z + step)
-            self.goto(x, y, z, feed=feed)
+        for pose in vertical_lift_points((x, y, z_from), z_to, step):
+            self.goto(*pose, dwell=dwell if step <= 0 else None, feed=feed)
 
     def swing(self, radius, z, deg_from, deg_to, step_deg=10.0, dwell=None,
               feed=None):
-        """让手在水平面绕基座转——也就是只动关节1。
-
-        一条 G0 直接给终点，不拆段、不分步。起点和终点半径相同、高度相同，
-        固件插补出来就是绕基座的弧线，只有底座在转，大臂小臂姿态不变。
-        step_deg 参数保留只是为了兼容旧调用，已不再使用。
-
-        等待时间单独按弧长算：两点直线距离是弦长，转 90° 时比弧长低估 11%，
-        直接用 goto 的直线估算会等不够。
-        """
+        """在较高的指令高度改变方位，再在目标 XY 降低。固件决定实际插补轨迹。"""
         if feed is None:
             feed = FEED_FAST
         end_x = radius * math.cos(math.radians(deg_to))
         end_y = radius * math.sin(math.radians(deg_to))
         if dwell is None:
             arc = radius * abs(math.radians(deg_to - deg_from))
-            dwell = max(DWELL_MIN, arc / SPEED_SWING + DWELL_PAD)
-        self.goto(end_x, end_y, float(z), dwell=dwell, feed=feed,
-                  tag='关节1 %+.0f° -> %+.0f° (r=%.0f z=%.0f)'
-                      % (deg_from, deg_to, radius, z))
+            swing_speed = SPEED_SWING
+            if self.vacuum_requested:
+                swing_speed = min(swing_speed, speed_of(min(feed, self.loaded_feed)))
+            dwell = max(DWELL_MIN, arc / swing_speed + DWELL_PAD)
+        if self.cur is None:
+            raise ValueError('改变方位前需要已知起始指令位置')
+        cx, cy, cz = self.cur
+        transit_z = max(cz, z)
+        if cz < transit_z:
+            self.ascend(cx, cy, cz, transit_z)
+        self.goto(end_x, end_y, transit_z, dwell=dwell, feed=feed,
+                  tag='改变方位 %+.0f° -> %+.0f°' % (deg_from, deg_to))
+        if z < transit_z:
+            self.descend(end_x, end_y, transit_z, z)
 
     def pump_on(self, hold=2.5):
         print('[吸泵] 发送指令：开启', flush=True)
         self.pump.publish(status(1))
+        self.vacuum_requested = True
         print('[吸泵] 接口返回：ROS 发布完成', flush=True)
         print('[吸泵] 吸附反馈：无压力/持物反馈，无法据此确认已吸附', flush=True)
         time.sleep(hold)
@@ -899,6 +823,7 @@ class Arm(object):
         print('[吸泵] 接口返回：ROS 发布完成；等待泄真空 %.1f s' % hold, flush=True)
         print('[吸泵] 释放反馈：无独立反馈，无法据此确认物块已释放', flush=True)
         time.sleep(hold)
+        self.vacuum_requested = False
 
 
 def snapshot(tag):
@@ -949,6 +874,8 @@ def do_place(arm, px, py, pz, lift_z, step):
     顺序不能改：先降到位、贴稳，再关泵，等真空泄完，最后才允许动。
     反过来做（先关泵再下降）方块会在半空脱落，落地位置偏一大截。
     """
+    if not (math.isfinite(pz) and math.isfinite(lift_z) and pz < lift_z):
+        raise ValueError('放置高度必须低于转运高度；未发送放置动作')
     arm.goto(px, py, lift_z, tag='放置点上方（保持抬升高度）')
     arm.descend(px, py, lift_z, pz, step=step)
     time.sleep(1.0)
@@ -956,9 +883,9 @@ def do_place(arm, px, py, pz, lift_z, step):
     # 这一步保留：关泵后方块虽已落地，但吸盘唇还压在顶面上，
     # 直接抬 180mm 会用唇边刮着顶面滑过去，把方块带歪。
     # 先原地抬 25mm 确认脱离，再抬到巡航高度。
-    arm.ascend(px, py, pz, pz + 25.0)
-    print('    微量上抬 25mm 确认脱离', flush=True)
-    arm.ascend(px, py, pz + 25.0, lift_z, feed=FEED_FAST)
+    clear_z = min(pz + 25.0, lift_z)
+    arm.ascend(px, py, pz, clear_z)
+    arm.ascend(px, py, clear_z, lift_z, feed=FEED_FAST)
 
 
 # ============================ 自动放置选点 ============================
@@ -971,19 +898,16 @@ BLOCK_SIDE = 100.0
 BLOCK_HALF_DIAG = BLOCK_SIDE * math.sqrt(2.0) / 2.0      # ≈ 70.7mm，仅作兜底
 
 
-def find_raised_blocks(depth, layer_rise=110.0, min_area=2000):
+def find_raised_blocks(depth, layer_rise=100.0, min_area=2000):
     """把画面里所有「比地面高出来的东西」都框出来，叠到第二层的也算。
 
     与 find_all_blocks 的唯一区别是凸起量上限：那边卡在 150mm（只认桌面层），
     这里放到 3.2 层。放置选点必须看得见已经叠起来的那摞，
     否则会把新方块放到别人头顶上。
     """
-    coef = ground_baseline(depth)
-    if coef is None:
-        return [], None
-    rows = np.arange(depth.shape[0])
-    expected = np.polyval(coef, rows)[:, None]
-    rise = expected - depth.astype(np.float32)
+    rise = rise_map(depth)
+    if rise is None:
+        raise ValueError('Cannot plan placement: support plane is unknown')
     hi = max(160.0, 3.2 * layer_rise)
     mask = ((rise > 35) & (rise < hi) & (depth > 0)).astype(np.uint8) * 255
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((13, 13), np.uint8))
@@ -1045,6 +969,8 @@ def scan_table(depth, block_z, stack_h, layer_rise,
         if dmm < depth_lo:
             continue
         layer, _rise = measure_layer(rise, b['box'], layer_rise, stack_h)
+        if layer is None:
+            raise ValueError('Cannot plan placement: obstacle layer is unknown')
         top_z = block_z + layer * stack_h
         ax, ay = pixel_to_arm(uv[0], uv[1], dmm, top_z)
         r = math.hypot(ax, ay)
@@ -1342,7 +1268,7 @@ def main():
     ap.add_argument('--layer', type=int, default=-1,
                     help='强制指定目标在第几层：0=桌面，1=叠在别的方块上。'
                          '默认 -1 表示由深度自动判断（靠顶面凸起量）')
-    ap.add_argument('--layer-rise', type=float, default=110.0, help=(
+    ap.add_argument('--layer-rise', type=float, default=None, help=(
         '一层方块顶面在深度图上实测的凸起量(mm)。相机是斜着看的，'
         '竖直 100mm 的方块在 rise 上量出来是 110mm 左右；'
         '两层就约 220。换相机角度要重新量'))
@@ -1359,12 +1285,14 @@ def main():
     ap.add_argument('--place-only', action='store_true',
                     help='方块已在吸盘上，只执行放下，不重新识别和抓取')
     ap.add_argument('--step', type=float, default=0.0,
-                    help='分段步长；0（默认）表示一步直达，给正数才拆成多段')
+                    help='下降分段步长；0 为一步直达。带载起提始终使用单段垂直指令')
     ap.add_argument('--feed-fast', type=float, default=FEED_FAST,
                     help='快速档进给率（平移/转关节）。实测 80000 是固件饱和点，'
                          '再高反而变慢，别超过它')
     ap.add_argument('--feed-slow', type=float, default=FEED_SLOW,
-                    help='慢速档进给率（贴方块、刚吸住后的初段抬升）')
+                    help='慢速档进给率（空载接近）')
+    ap.add_argument('--feed-loaded', type=float, default=FEED_LOADED,
+                    help='开泵至泄压等待结束的进给率上限，默认 F10000，可调低')
     ap.add_argument('--execute', action='store_true')
     ap.add_argument('--detect-only', action='store_true',
                     help='走到观察位完成识别、打印结果后停下，不抓取。'
@@ -1373,6 +1301,18 @@ def main():
                     help='走到观察位后用「深度找框 + 模板分类」逐个打印分数，'
                          '只做实验对比，不动臂抓取')
     args = ap.parse_args()
+    if not all(math.isfinite(f) and f >= 1 for f in (args.feed_loaded, args.feed_slow, args.feed_fast)):
+        ap.error('进给率必须是至少为 1 的有限值')
+    if args.feed_loaded > FEED_LOADED:
+        ap.error('--feed-loaded 上限是 F%.0f' % FEED_LOADED)
+    # Temporary lock: grasp height and contact feedback require field validation.
+    # This CLI must not command the arm until the press-down incident is resolved.
+    if args.execute or args.detect_only or args.classify_test or args.place_only:
+        raise SystemExit(
+            'Arm motion locked after press-down incident. '
+            'Validate contact height and independent feedback before re-enabling. '
+            'Run without motion flags for a preview.'
+        )
     if args.detect_only or args.classify_test:
         args.execute = True  # 允许走到观察位，识别完再退出
 
@@ -1415,7 +1355,7 @@ def main():
         obs = parse_xyz(args.observe)
 
     rospy.init_node('arm_pick_place', anonymous=True)
-    arm = Arm()
+    arm = Arm(loaded_feed=min(args.feed_loaded, FEED_SLOW, FEED_FAST))
 
     # 标定必须在任何反投影、任何动作之前读好：A/B、内参、方块高度、吸盘偏移
     # 全部来自标定文件，命令行只用来覆盖（--block-z 等留空就走文件值）。
@@ -1432,6 +1372,9 @@ def main():
         args.grasp_offset = calib['grasp_offset']
     if args.stack_height is None:
         args.stack_height = calib['stack_height']
+    if args.layer_rise is None:
+        args.layer_rise = args.stack_height
+    print('[layer] physical layer spacing: %.1f mm' % args.layer_rise, flush=True)
     print('实际使用：block_z=%.1f  grasp_offset=%.1f  stack_height=%.1f'
           % (args.block_z, args.grasp_offset, args.stack_height), flush=True)
 
@@ -1443,6 +1386,7 @@ def main():
             return 1
         px, py, pz = parse_place(args.place_at, args.block_z + args.grasp_offset)
         print('=== 只执行放置 -> (%.1f, %.1f, %.1f) ===' % (px, py, pz), flush=True)
+        arm.vacuum_requested = True  # --place-only 从持物状态接管
         arm.attach()
         arm.goto(home[0], home[1], args.lift_z, tag='从初始位降到抬升高度')
         do_place(arm, px, py, pz, args.lift_z, args.step)
@@ -1533,8 +1477,9 @@ def main():
                 # 否则 x/y 会偏出去十几到几十毫米
                 dlayer, drise = measure_layer(rise, dbx, args.layer_rise,
                                               args.stack_height)
-                if args.layer >= 0:
-                    dlayer = args.layer
+                if dlayer is None:
+                    print('      %s: layer unknown; no arm coordinates generated' % d.label, flush=True)
+                    continue
                 dtop_z = args.block_z + dlayer * args.stack_height
                 ax = ay = ar = float('nan')
                 if dmm > 0:
@@ -1585,9 +1530,12 @@ def main():
     # 抓它的吸盘必须同步抬高，否则要么吸不到、要么把下层方块压坏。
     layer, measured = measure_layer(rise, block['box'], args.layer_rise,
                                    args.stack_height)
-    if args.layer >= 0:
-        print('    层数由 --layer %d 强制指定' % args.layer, flush=True)
-        layer = args.layer
+    if layer is None:
+        print('[layer] unknown: cannot calculate grasp height; stop', flush=True)
+        return 3
+    if args.layer >= 0 and args.layer != layer:
+        print('[layer] requested layer disagrees with measurement; stop', flush=True)
+        return 3
     top_z = args.block_z + layer * args.stack_height
     if layer > 0:
         print('    === 目标在第 %d 层：顶面比桌面高 %.0fmm，抓取高度整体抬高 %.0fmm ==='
@@ -1666,6 +1614,8 @@ def main():
     # 抓取高度跟着层数走：吸盘唇要落在方块顶面上，
     # 第二层的顶面比桌面层高一个方块身，所以 z 也整体抬高同样的量。
     grasp_z = top_z + args.grasp_offset
+    if not (math.isfinite(grasp_z) and math.isfinite(args.lift_z) and args.lift_z > grasp_z):
+        raise ValueError('带载起提终点必须高于抓取高度')
     # 巡航高度也要跟着抬：吸盘唇比末端板低 82mm，叠在第二层的方块
     # 顶面已经在 -32，如果还按 70 平移过去，吸盘唇只有 20mm 余量，
     # 稍微下沉就刮到方块。给到 grasp_z + 40，保证有 40mm 的接近余量。
@@ -1687,14 +1637,10 @@ def main():
     arm.pump_on(hold=2.5)
 
     print('=== 7. 纯垂直抬升（x/y 锁定不动）===', flush=True)
-    # 刚吸住的头 40mm 一定走慢档：真空还没完全咬住时加速度大了方块会被甩脱。
-    # 过了这一段已经贴稳，切快档，省掉后面 140mm 的一半时间。
-    warm = min(args.lift_z, grasp_z + 40.0)
-    arm.ascend(x, y, grasp_z, warm, step=args.step)
-    if args.lift_z > warm + 1.0:
-        arm.ascend(x, y, warm, args.lift_z, step=args.step, feed=FEED_FAST)
+    # 每次 G0 都会重新起停，带载离开支撑面到转运高度只发一个固定 XY 的目标。
+    arm.ascend(x, y, grasp_z, args.lift_z, feed=arm.loaded_feed)
     _, lifted_path = snapshot('02_lifted')
-    print('    抬升完成: %s' % lifted_path, flush=True)
+    print('    起提指令等待结束，持物待确认: %s' % lifted_path, flush=True)
 
     placed = False
     if args.place_on:

@@ -2,19 +2,21 @@
   <arg name="workspace_root" default="/home/spark/SUAT/spark"/>
   <arg name="rollout_candidate" default="true"/>
   <arg name="planner_mode" default="legacy"/>
+  <arg name="path_control" default="false"/>
   <arg name="local_planner_settings" default="{}"/>
   <arg name="controller_hz" default="10.0"/>
   <arg name="speed_profile" default="slow"/>
   <arg name="navigation_owner" default="/suat_field_navigation"/>
   <arg name="mission_keepout" default="false"/>
+  <arg name="keepout_file" default="data/navigation/central_pickup_keepout.json"/>
   <arg name="max_v" default="0.08"/>
   <arg name="max_w" default="0.30"/>
   <arg name="accel_v" default="0.20"/>
   <arg name="accel_w" default="0.60"/>
   <!-- Reuse running localization/drivers. Never starts a mission or arm driver.
        The output gate starts DISARMED and creates no /cmd_vel publisher. -->
-  <node pkg="nodelet" type="nodelet" name="suat_navigation_nodelet_manager" args="manager" required="true"/>
-  <node pkg="nodelet" type="nodelet" name="suat_navigation_smoother"
+  <node unless="$(arg path_control)" pkg="nodelet" type="nodelet" name="suat_navigation_nodelet_manager" args="manager" required="true"/>
+  <node unless="$(arg path_control)" pkg="nodelet" type="nodelet" name="suat_navigation_smoother"
         args="load follower_velocity_smoother/VelocitySmootherNodelet suat_navigation_nodelet_manager" required="true">
     <param name="speed_lim_v" value="$(arg max_v)"/>
     <param name="speed_lim_w" value="$(arg max_w)"/>
@@ -51,10 +53,11 @@
     <param name="DWAPlannerROS/acc_lim_x" value="$(arg accel_v)" type="double"/>
     <param name="DWAPlannerROS/acc_lim_trans" value="$(arg accel_v)" type="double"/>
     <param name="DWAPlannerROS/acc_lim_theta" value="$(arg accel_w)" type="double"/>
-    <param name="DWAPlannerROS/latch_xy_goal_tolerance" value="false" type="bool"/>
+    <param unless="$(arg rollout_candidate)" name="DWAPlannerROS/latch_xy_goal_tolerance" value="false" type="bool"/>
     <param name="DWAPlannerROS/scaling_speed" value="$(arg max_v)" type="double"/>
     <param name="oscillation_timeout" value="20.0" type="double"/>
     <param name="controller_patience" value="5.0" type="double"/>
+    <param if="$(arg path_control)" name="recovery_behavior_enabled" value="false"/>
     <remap from="cmd_vel" to="/suat/navigation/raw_cmd_vel"/>
   </node>
   <node pkg="suat_mission" type="navigation_gate_node.py" name="suat_navigation_gate" output="screen" required="true">
@@ -63,6 +66,7 @@
     <param name="speed_profile" value="$(arg speed_profile)"/>
     <param name="navigation_owner" value="$(arg navigation_owner)"/>
     <param name="mission_keepout" value="$(arg mission_keepout)"/>
+    <param name="keepout_file" value="$(arg keepout_file)"/>
     <param name="profile" value="field_$(arg planner_mode)"/>
   </node>
 </launch>

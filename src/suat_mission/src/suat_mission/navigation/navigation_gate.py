@@ -46,13 +46,9 @@ class NavigationGate:
         self.started = self.heartbeat_at = None
         self.raw = self.smooth = None
 
-    def arm(self, now, fault=None, caps=None):
+    def arm(self, now, fault=None):
         if self.state != 'DISARMED' or fault:
             raise ValueError(fault or 'stop/release required before a new run')
-        v,w=caps if caps is not None else (self.MAX_V,self.MAX_W)
-        if not (0<v<=self.MAX_V and 0<w<=self.MAX_W):
-            raise ValueError('navigation lease limits exceed configured speed')
-        self.lease_v,self.lease_w=v,w
         self.state, self.reason = 'ARMED', 'waiting_for_fresh_navigation_input'
         self.token, self.sequence = uuid.uuid4().hex, -1
         self.started = self.heartbeat_at = now
@@ -129,8 +125,20 @@ class NavigationGate:
         self.__init__(self.MAX_V,self.MAX_W,self.MAX_RUN)
 
 
-def goal_is_free(grid, x, y, radius=.25):
+GOAL_PREFILTER_RADIUS_M = .25
+
+
+def goal_check_radius(body_radius, precise_pickup=False):
+    return body_radius + .01 if precise_pickup else max(GOAL_PREFILTER_RADIUS_M, body_radius)
+
+
+def goal_is_free(grid, x, y, radius=GOAL_PREFILTER_RADIUS_M):
     """Check the full conservative circular footprint in a non-rotated map."""
+    return blocked_footprint_cell(grid, x, y, radius) is None
+
+
+def blocked_footprint_cell(grid, x, y, radius):
+    """Return the first occupied, unknown or out-of-grid cell within the footprint."""
     resolution, width, height = grid['resolution'], grid['width'], grid['height']
     ox, oy = grid['origin']
     if not all(math.isfinite(v) for v in (x, y, radius, resolution)) or resolution <= 0 or radius <= 0:
@@ -144,8 +152,8 @@ def goal_is_free(grid, x, y, radius=.25):
             dy = max(oy+row*resolution-y, 0.0, y-(oy+(row+1)*resolution))
             if dx*dx+dy*dy > radius*radius:
                 continue
-            if not (0 <= col < width and 0 <= row < height):
-                return False
-            if grid['data'][row*width+col] != 0:
-                return False
-    return True
+            value = grid['data'][row*width+col] if 0 <= col < width and 0 <= row < height else None
+            if value != 0:
+                return {'index': [col, row], 'value': value,
+                        'cell_center_xy': [ox+(col+.5)*resolution, oy+(row+.5)*resolution]}
+    return None

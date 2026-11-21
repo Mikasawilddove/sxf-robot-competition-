@@ -163,6 +163,7 @@ class DirectionEvidence:
     confirmed: bool = False
     stamp_ns: int = None  # required for a per-frame field label or verified marker
     marker: MarkerEvidence = None
+    observation_frame: str = ''  # optical frame of a marker image from this stopped board visit
 
     def __post_init__(self):
         object.__setattr__(self, 'zones', tuple(self.zones))
@@ -177,6 +178,11 @@ class DirectionEvidence:
         if len(self.zones) != 3 or set(self.zones) != {'B', 'C', 'D'}:
             return 'invalid_direction_slots'
         if self.source == 'fixed_reference':
+            return None
+        if self.source == 'station_zone_markers':
+            if (type(self.stamp_ns) is not int or not 0 < self.stamp_ns <= stamp_ns
+                    or not self.observation_frame or self.observation_frame != frame_id):
+                return 'station_marker_image_mismatch'
             return None
         if self.source not in ('field_label', 'verified_marker'):
             return 'unverified_direction_source'

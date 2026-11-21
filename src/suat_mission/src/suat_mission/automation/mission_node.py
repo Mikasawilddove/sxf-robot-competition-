@@ -28,7 +28,6 @@ from suat_mission.contracts import ActionResult, Outcome
 from suat_mission.observations import decode_scene, decode_placement
 from suat_mission.automation.run_gate import RunGate
 from suat_mission.navigation.navigation_ros import Navigator, NavigationPlanError, RosNavigationTransport
-from suat_mission.navigation.navigation_gate import goal_is_free
 from suat_mission.automation.scope import scope_from_config
 from suat_mission.automation.readiness import inspect_config, validate_board_configuration
 from suat_mission.automation.run_record import RunRecorder, file_identity
@@ -161,9 +160,11 @@ class RosRobot:
         if self._navigator is None:
             # Use the same canonical workspace as preparation and map recording.
             root = Path(__file__).resolve().parents[5]
-            self._navigator = Navigator(root, self._param('navigation_speed', 'slow'),
+            self._navigator = Navigator(root, self._param('navigation_speed', 'fast'),
                                         owner='/suat_mission', health_check=self._ensure_running,
-                                        planner_mode=self._param('navigation_planner_mode') or None)
+                                        planner_mode=self._param('navigation_planner_mode') or None,
+                                        keepout_file=self._param('navigation_keepout_file',
+                                            'data/navigation/central_pickup_keepout.json'))
         return self._navigator
 
     def prepare_navigation(self):
@@ -477,28 +478,30 @@ class RosRobot:
         pass
 
     def _navigate(self, name, remaining):
+        from suat_mission.navigation.pickup_keepout import is_pickup_station
+        from suat_mission.navigation.navigation_budget import NavigationBudget
+        started = time.monotonic()
+        budget = NavigationBudget(self.nav_timeout)
         self._ensure_running()
         navigator = self._get_navigator()
         item = {'name': name, 'pose': list(self.points[name])}
-        def make_plan(previous_attempts=None):
-            try:
-                return navigator.plan(navigator.pose(), item['pose'], navigator.grid())
-            except NavigationPlanError as exc:
-                report={'passed':False,'phase':'planning','target':item,
-                        'error':str(exc),'rejected_plan':exc.plan,
-                        'motion_goal_sent':False,'output_lease_opened':False}
-                if previous_attempts:
-                    report['previous_execution_attempts']=previous_attempts
-                self.last_navigation_result=report
-                sink=getattr(self,'navigation_evidence_sink',None)
-                if sink is not None:sink(report)
-                raise
+        candidate = (name == 'Classification_area' or name in getattr(self, 'board_candidates', {})
+                     or name in self.scope.sorting_points)
+        actual_pose = navigator.pose()
+        sink = getattr(self, 'navigation_evidence_sink', None)
         try:
-            plan = make_plan()
+            plan = navigator.plan(actual_pose, item['pose'], navigator.grid(),
+                                  pickup_station=is_pickup_station(navigator.keepout,name))
         except NavigationPlanError as exc:
-            if name in getattr(self, 'board_candidates', {}):
+            report={'passed':False,'phase':'planning','target':item,'first_failure_stage':'planning',
+                    'actual_pose':actual_pose,'leg_elapsed_s':time.monotonic()-started,
+                    'error':str(exc),'rejected_plan':exc.plan,
+                    'motion_goal_sent':False,'output_lease_opened':False}
+            self.last_navigation_result=report
+            if sink is not None:sink(report)
+            if candidate and str(exc) in NavigationPlanError.STATION_ERRORS:
                 return ActionResult(self.active_context, Outcome.UNREACHABLE,
-                                    'no motion issued; board station plan refused: '+str(exc))
+                                    'no motion issued; candidate station plan refused: '+str(exc))
             raise MissionError('navigate '+name+': '+str(exc)) from exc
         self._before_navigation(name)
         plan['timeout_s'] = min(plan['timeout_s'], self.nav_timeout, float(remaining))
@@ -506,23 +509,15 @@ class RosRobot:
             self._ensure_running()
             self.nav_active = True
         try:
-            report = navigator.execute_leg(item, plan, context=self.active_context,station_approach=True)
-            attempts=[report]
-            # Only an idle, released navigation failure may replan once. A stop,
-            # stale sensor, ownership fault or uncertain payload never retries.
-            retryable=(report.get('action_terminal_state')==4 or
-                       report.get('error')=='no navigation progress for 20 seconds')
-            if not report['passed'] and retryable and report.get('output_released'):
-                self._ensure_running()
-                if time.monotonic()+navigator.executor_stop_budget()<self.active_context.deadline:
-                    plan=make_plan(attempts)
-                    report=navigator.execute_leg(item,plan,context=self.active_context,station_approach=True)
-                    attempts.append(dict(report))
-                    report['attempts']=attempts
+            report = navigator.execute_leg(item, plan, context=self.active_context,station_approach=True,budget=budget)
+            report['action_elapsed_s'] = time.monotonic()-started
             self.last_navigation_result = report
-            sink = getattr(self, 'navigation_evidence_sink', None)
             if sink is not None:
                 sink(report)
+            if (candidate and name in self.scope.sorting_points
+                    and navigator.can_try_next_station(report,self.active_context)):
+                self._ensure_running()
+                return ActionResult(self.active_context, Outcome.UNREACHABLE, json.dumps(report))
             outcome = Outcome.CONFIRMED if report['passed'] else Outcome.FAILED
             return ActionResult(self.active_context, outcome, json.dumps(report, ensure_ascii=True))
         finally:
@@ -577,7 +572,8 @@ class SerialRosRobot(RosRobot):
         self.feedback_timeout=float(self._param('feedback_timeout',15.))
         self.observation_timeout=float(self._param('observation_timeout',5.))
         self.serial_runtime=SerialMissionRuntime(root,self.config,self._serial_scene,
-            lambda: RosRobot._ensure_running(self,check_attachment=False),self._align_base)
+            lambda: RosRobot._ensure_running(self,check_attachment=False))
+        self._pickup_prepared = False
 
     def _serial_scene(self, after, deadline):
         with self.cv:
@@ -589,46 +585,71 @@ class SerialRosRobot(RosRobot):
                     RosRobot._ensure_running(self,check_attachment=False)
                 if self.latest_scene is not None and self.latest_scene.version>after:
                     age=time.monotonic()-self.latest_scene.observed_at
-                    if age<=float(self._param('observation_max_age',2.)):
+                    if 0<=age<=float(self._param('observation_max_age',2.)):
                         return self.latest_scene
                 self.cv.wait(min(.1,max(0.,deadline-time.monotonic())))
         raise TimeoutError('no fresh physical-instance observation from the camera adapter')
 
     def preflight(self, preparing=False):
-        self.serial_runtime.open()
-        after=-1 if self.latest_scene is None else self.latest_scene.version
-        self._serial_scene(after,time.monotonic()+self.observation_timeout)
+        if preparing:
+            self._require_preparing()
+            after = -1 if self.latest_scene is None else self.latest_scene.version
+            self._serial_scene(after, time.monotonic()+self.observation_timeout)
+        else:
+            self._ensure_running(check_attachment=False)
+        self.serial_runtime.open(preparing=preparing,
+                                 check_preparing=self._require_preparing if preparing else None,
+                                 write_if_running=getattr(self, 'arm_write_if_running', None))
+
+    def _require_preparing(self):
+        if rospy.is_shutdown() or self.stop_event.is_set() or not self.preparation_permitted():
+            raise MissionError('preparation was stopped')
 
     def prepare_observation(self, kind):
         self._require_stopped_base()
-        if kind=='objects':
-            self.serial_runtime.bootstrap(min(self.deadline,time.monotonic()+float(self._param('action_timeout',60.))))
-        self.serial_runtime.observation(kind,min(self.deadline,time.monotonic()+float(self._param('action_timeout',60.))))
+        if kind != 'objects':
+            return
+        runtime = self.serial_runtime
+        use_left_view = (self.scope.name == 'cake-only'
+                         and runtime.geometry.values.get('cake_pickup_view_left_mm') is not None)
+        if not self._pickup_prepared or use_left_view:
+            deadline = min(self.deadline, time.monotonic()+float(self._param('action_timeout',60.)))
+            runtime.prepare_empty_observation(
+                self._param('arm_unfold_pose_mm', (191.74, -0.30, 124.09)), deadline,
+                left_view=runtime.geometry.values['cake_pickup_view_left_mm'] if use_left_view else None)
+            runtime.bootstrap(deadline)
+            self._pickup_prepared = True
+        runtime.observe_objects()
+
+    def pickup_scenes(self):
+        """Yield stopped RGB-D snapshots until the first eligible candidates are found."""
+        end = min(self.deadline, time.monotonic()+self.observation_timeout)
+        received = False
+        while time.monotonic() < end:
+            try:
+                scene = self.serial_runtime.fresh_scene(end)
+            except TimeoutError:
+                if not received:
+                    raise
+                return
+            self.selected_scene = scene
+            received = True
+            yield scene
 
     def set_deadline(self,value):
         super().set_deadline(value)
         self.config['_deadline']=value
 
-    def detect_objects(self):
-        scene=super().detect_objects()
-        self.serial_runtime.observe_hand(scene)
-        return scene
-
     def board_stations(self):
         self._ensure_running()
         if not self.board_candidates:
             return ['Classification_area']
-        navigator = self._get_navigator()
-        grid = navigator.grid()
-        radius = max(.25, navigator.radius)
-        names = []
         for name, item in self.board_candidates.items():
-            clear = goal_is_free(grid, *item['pose'][:2], radius=radius)
             self.serial_runtime.event('board_station_candidate', station=name, pose=item['pose'],
-                view_evidence=item['view_evidence'], clearance_radius_m=radius, saved_map_clear=clear)
-            if clear:
-                names.append(name)
-        return names
+                view_evidence=item['view_evidence'])
+        # The normal navigation plan applies the saved-map footprint and reports
+        # why a station was rejected, including the candidate for the next try.
+        return list(self.board_candidates)
 
     def read_board_mapping(self, *, run_id, station):
         result=self.serial_runtime.read_board(run_id, station)
@@ -650,55 +671,61 @@ class SerialRosRobot(RosRobot):
             raise MissionError('base stop and released navigation required before observation or manipulation')
         self._ensure_running()
 
-    def _align_base(self, dx_mm, dy_mm, parent, index):
-        from suat_mission.contracts import ActionContext
-        navigator=self._get_navigator();start=navigator.pose()
-        mount=self.serial_runtime.geometry.number('arm_yaw_in_base_rad')
-        turn=start[2]+mount;c,s=math.cos(turn),math.sin(turn)
-        goal=[start[0]+(c*dx_mm-s*dy_mm)/1000.,start[1]+(s*dx_mm+c*dy_mm)/1000.,start[2]]
-        child=ActionContext(parent.run_id,parent.goal_id+':base:'+str(index),'navigate',
-            parent.object_id,parent.scene_version,parent.deadline)
-        plan=navigator.plan(start,goal,navigator.grid())
-        plan['timeout_s']=min(plan['timeout_s'],max(0.,parent.deadline-time.monotonic()))
-        return navigator.execute_leg({'name':'pickup_align','pose':goal},plan,context=child,
-            phase='align',xy_tolerance=float(self._param('base_alignment_tolerance_m',.01)),yaw_tolerance=.05)
-
     def _pick(self, target, label):
         self._require_stopped_base()
-        result=self.serial_runtime.pick(target,label,self.active_context)
+        result=self.serial_runtime.pick(target,label,self.active_context,scene=self.selected_scene)
         self.holding=self.serial_runtime.held is not None
+        return result
+
+    def navigate(self, name, remaining, context):
+        self.last_confirmed_station = None
+        result = super().navigate(name, remaining, context)
+        if result.outcome == Outcome.CONFIRMED:
+            self.last_confirmed_station = (name, result.context.run_id, result.context.object_id)
         return result
 
     def _drop(self, zone, label, context):
         self._require_stopped_base()
+        arrived = getattr(self, 'last_confirmed_station', None)
+        if arrived != ('Collection_' + zone, context.run_id, context.object_id):
+            return ActionResult(context, Outcome.UNKNOWN, 'current payload has no confirmed destination arrival')
         result=self.serial_runtime.drop(zone,label,context)
         self.holding=self.serial_runtime.held is not None
         return result
 
+    def stow_after_placement(self, deadline):
+        runtime = self.serial_runtime
+        runtime.move('empty_travel', runtime.geometry.values['empty_travel_pose_mm'], deadline)
+
     def empty_confirmed(self):
-        return self.serial_runtime.empty_seen and self.serial_runtime.held is None
+        return self.serial_runtime.confirm_empty(self.latest_scene, self.deadline)
 
     def _before_navigation(self, name):
-        if self.serial_runtime.held is None:
-            self._require_stopped_base()
-            self.serial_runtime.open()
-            self.serial_runtime.move('empty_travel',self.serial_runtime.geometry.values['empty_travel_pose_mm'],
-                min(self.active_context.deadline,self.deadline))
-        self.serial_runtime.event('navigate',station=name)
+        runtime = self.serial_runtime
+        if self._pickup_prepared and runtime.held is None:
+            travel = runtime.geometry.values['empty_travel_pose_mm']
+            if math.dist(runtime.arm_pose,travel) > runtime.session.correction_tolerance_mm:
+                self._require_stopped_base()
+                deadline = min(self.active_context.deadline,self.deadline)
+                runtime.move('empty_travel',travel,deadline)
+        runtime.event('navigate',station=name)
 
     def delivery_cost(self, target, zone):
         x,y,_=self._get_navigator().pose();gx,gy,_=self.points['Collection_'+zone]
         return math.hypot(gx-x,gy-y)
 
     def stop_motion(self):
-        RosRobot.stop_motion(self)
-        runtime=getattr(self,'serial_runtime',None)
-        if runtime is not None and runtime.session is not None and runtime.session.handle is not None:
-            runtime.session.stop(time.monotonic()+3.)
+        try:
+            RosRobot.stop_motion(self)
+        finally:
+            runtime=getattr(self,'serial_runtime',None)
+            if runtime is not None and runtime.session is not None:
+                runtime.session.stop(time.monotonic()+3.)
 
     def close(self):
         status=self.serial_runtime.close()
-        self.recovery_required=bool(status.get('pump_may_be_on'))
+        self.recovery_required=bool(self.serial_runtime.held is not None
+                                    or status.get('pump_may_be_on') or status.get('ownership_retained'))
         if not self.recovery_required:
             RosRobot.close(self)
         return status
@@ -736,6 +763,8 @@ class Node:
             preparation_id=self.preparation_id,
             recovery_required=bool(getattr(self.robot,'recovery_required',False)),
             execution_backend=self.config.get('execution_backend'),
+            workspace_root=str(Path(__file__).resolve().parents[5]),
+            pickup_geometry_file=rospy.get_param('~pickup_geometry_file',''),
             core_delivery_id=self.config.get('core_delivery_id',rospy.get_param('~core_delivery_id','')),
             phase=(getattr(getattr(self.robot,'serial_runtime',None),'events',[]) or [{}])[-1].get('phase'),
             deadline=self.gate.deadline, budget_anchor_monotonic=self.gate.budget_anchor,
@@ -756,7 +785,7 @@ class Node:
             self.gate.stop()
             robot = self.robot
         rospy.logerr('%s', self.error)
-        if robot:
+        if robot and not self.preparing:
             robot.stop_motion()
         self.publish_state()
 
@@ -800,7 +829,8 @@ class Node:
             '/suat/perception/grasp_status','/suat/manipulation/active',
             '/suat/navigation/state','/suat/placement/request','/suat/placement/result')}
         types.update({'/suat/mission/stop':Bool,'/move_base/result':MoveBaseActionResult,
-                      '/cmd_vel':Twist,'/objects':Detection2DArray})
+                      '/cmd_vel':Twist,'/objects':Detection2DArray,
+                      '/suat/navigation/raw_cmd_vel':Twist,'/suat/navigation/smoothed_cmd_vel':Twist})
         types[rospy.resolve_name(self.config.get('instances_topic','/suat/perception/instances'))]=String
         for key in ('arm_arrived_topic','object_attached_topic'):
             if self.config.get(key):types[rospy.resolve_name(self.config[key])]=Bool
@@ -820,9 +850,10 @@ class Node:
     def _make_recorder(self):
         root=Path(__file__).resolve().parents[5]
         config=self.config;selected=scope_from_config(config)
-        paths=[Path(__file__).resolve(),root/'src/suat_mission/src/suat_mission/automation/mission.py',
-               root/'src/suat_mission/src/suat_mission/serial_mission.py',
-               root/'src/suat_mission/src/suat_mission/navigation_ros.py']
+        source=Path(__file__).resolve().parents[1]
+        paths=[Path(__file__).resolve(),source/'automation/mission.py',source/'automation/serial_mission.py',
+               source/'manipulation/arm_session.py', source/'vision/mission_scene_node.py',
+               source/'vision/experimental_vision.py',source/'navigation/navigation_ros.py']
         metadata={name:config.get(name) for name in ('operator','layout_id','calibration_id','execution_backend')}
         metadata.update(entrypoint=str(Path(__file__).resolve()),speed_profile=config['navigation_speed'],
             code_files={str(p):file_identity(p) for p in paths},
@@ -835,7 +866,8 @@ class Node:
             recording_policy='selected topic samples and source paths; no digest computation')
         topics=['/suat/mission/command','/suat/mission/stop',
                 config.get('instances_topic','/suat/perception/instances'),'/suat/perception/grasp_status',
-                '/suat/manipulation/active','/suat/navigation/state','/move_base/result','/cmd_vel']
+                '/suat/manipulation/active','/suat/navigation/state','/move_base/result','/cmd_vel',
+                '/suat/navigation/raw_cmd_vel','/suat/navigation/smoothed_cmd_vel']
         self.recorder=RunRecorder(config.get('run_root',str(root/'reports/runs')),
             self.gate.run_id,selected.name,config.get('record_topics',topics),metadata)
         self._record_topics()
@@ -844,7 +876,7 @@ class Node:
         robot = None
         try:
             config = dict(rospy.get_param('~', {}))
-            config.setdefault('navigation_speed', 'slow')
+            config.setdefault('navigation_speed', 'fast')
             if scope is not None:
                 config['mission_scope'] = scope
             if config.get('execution_backend')=='serial_rgbd':
@@ -866,12 +898,15 @@ class Node:
             robot_type=SerialRosRobot if config.get('execution_backend')=='serial_rgbd' else RosRobot
             robot = robot_type(permitted=lambda: self.gate.permitted(robot.run_token), config=config)
             robot.run_token = None
+            robot.arm_write_if_running = lambda write: self.gate.write_if_running(robot.run_token, write)
             robot.board_evidence_sink = lambda decision: self.record('board_decision', decision)
             robot.navigation_evidence_sink = lambda result: self.record('navigation', result)
-            robot.preparation_permitted = lambda: self.gate.state == 'idle' and not self.error
+            robot.preparation_permitted = lambda: self.preparing and self.gate.state == 'idle' and not self.error
             with self.lock:
                 self.robot = robot
             robot.preflight(preparing=True)
+            if not robot.preparation_permitted():
+                raise MissionError('preparation was stopped')
             robot.prepare_navigation()
             with self.lock:
                 if self.gate.state != 'idle' or self.error:
@@ -879,18 +914,31 @@ class Node:
                 self.record('ready', {'scope': self.scope})
                 self.prepared = True
         except Exception as exc:
-            self.error = 'preparation failed: ' + str(exc)
+            with self.lock:
+                self.error = 'preparation failed: ' + str(exc)
+                self.prepared = False
+                self.gate.stop()
             rospy.logerr('%s', self.error)
-            if robot:
-                robot.close()
-            self.robot = robot if getattr(robot,'recovery_required',False) else None
+            self._close_robot(robot)
             self._close_record_topics()
             if self.recorder and not self.recorder.finished:
                 self._finish_record({'run_id': self.gate.run_id, 'status': 'preparation_failed',
                                      'error': self.error}, {})
         finally:
-            self.preparing = False
-            self.publish_state()
+            with self.lock:
+                self.preparing = False
+                self.publish_state()
+
+    def _close_robot(self, robot):
+        if robot is None:
+            return
+        try:
+            robot.close()
+        except Exception as exc:
+            robot.recovery_required = True
+            self.error = (self.error + '; ' if self.error else '') + 'arm cleanup failed: ' + str(exc)
+            rospy.logerr('%s', self.error)
+        self.robot = robot if getattr(robot, 'recovery_required', False) else None
 
     def command(self, msg):
         try:
@@ -910,16 +958,20 @@ class Node:
                 try:
                     if self.thread and self.thread.is_alive():
                         raise ValueError('worker is still active')
+                    if self.preparing:
+                        raise ValueError('preparation is still active')
                     if getattr(self.robot,'recovery_required',False):
                         raise ValueError('possible payload retained; use explicit release_for_recovery after supporting it')
-                    self.gate.reset()
                     if self.prepared:
                         self._close_record_topics()
-                        self.robot.close()
-                        self.robot = None
                         self.prepared = False
+                        self._close_robot(self.robot)
                         self._finish_record({'run_id': self.gate.run_id, 'status': 'cancelled_before_start',
                                              'error': 'reset before start'}, {})
+                        if self.robot is not None:
+                            self.gate.stop()
+                            raise ValueError('serial ownership is retained for recovery')
+                    self.gate.reset()
                     self.error = None
                     self.publish_state()
                 except ValueError as exc:
@@ -927,8 +979,8 @@ class Node:
             return
         if value == 'prepare':
             with self.lock:
-                if (self.preparing or self.prepared or self.gate.active is not None
-                        or self.gate.state != 'idle' or getattr(self.robot,'recovery_required',False)):
+                if (self.preparing or self.prepared or self.robot is not None or self.gate.active is not None
+                        or self.gate.state != 'idle' or (self.thread and self.thread.is_alive())):
                     rospy.logwarn('Preparation refused: reset after the previous run first')
                     return
                 self.error = None
@@ -938,7 +990,12 @@ class Node:
                 self.preparation_id = request.get('request_id') or uuid.uuid4().hex
                 self.thread = threading.Thread(target=self.prepare,
                     args=(request.get('scope'), request.get('entered_at_monotonic')), daemon=True)
-                self.thread.start()
+                try:
+                    self.thread.start()
+                except Exception as exc:
+                    self.preparing = False
+                    self.gate.stop()
+                    self.error = 'could not start preparation worker: ' + str(exc)
                 self.publish_state()
             return
         if value != 'start':
@@ -952,6 +1009,7 @@ class Node:
                 rospy.logwarn('Start refused: prepared run ID mismatch')
                 return
             token = None
+            recorded = False
             try:
                 token = self.gate.start()
                 self.recorder.start(self.gate.started_at, self.gate.deadline,
@@ -960,30 +1018,29 @@ class Node:
                                      'stop_margin_s': self.gate.stop_margin,
                                      'judge_clock_already_running': self.gate.clock_already_running,
                                      'budget_anchor_monotonic': self.gate.budget_anchor})
+                recorded = True
+                self.prepared = False
+                self.robot.run_token = token
+                self.thread = threading.Thread(target=self.run, args=(token,), daemon=True)
+                self.thread.start()
             except Exception as exc:
+                self.prepared = False
+                self.gate.stop()
                 if token is not None:
-                    self.record_failed(exc)
                     self.gate.finish(token)
-                else:
-                    self.error = 'start refused: ' + str(exc)
-                    self.prepared = False
-                    self.gate.stop()
+                self.error = 'start failed: ' + str(exc)
+                if self.robot is not None:
+                    self.robot.run_token = None
                 self._close_record_topics()
-                if self.robot:
-                    self.robot.close()
-                    self.robot = None
-                report = {'run_id': self.gate.run_id,
-                          'status': 'start_refused' if token is None else 'recording_failed_before_execution',
-                          'error': self.error}
+                self._close_robot(self.robot)
+                status = 'start_refused' if token is None else (
+                    'startup_failed_before_execution' if recorded else 'recording_failed_before_execution')
+                report = {'run_id': self.gate.run_id, 'status': status, 'error': self.error}
                 self._finish_record(report, {})
                 self.report_pub.publish(String(data=json.dumps(report)))
                 self.publish_state()
                 rospy.logwarn('Start refused: %s', exc)
                 return
-            self.prepared = False
-            self.robot.run_token = token
-            self.thread = threading.Thread(target=self.run, args=(token,), daemon=True)
-            self.thread.start()
             self.publish_state()
 
     def _finish_record(self, report, final_state):
@@ -1013,6 +1070,7 @@ class Node:
                                 target_thresholds=config.get('target_thresholds', {}),
                                 target_roi=config.get('target_roi') or None, each_count=int(config.get('each_count', 3)),
                                 action_timeout=float(config.get('action_timeout', 60)),
+                                navigation_timeout=float(config.get('navigation_timeout', 60)),
                                 observation_max_age=float(config.get('observation_max_age', 2)),
                                 deadline_seconds=self.gate.deadline - self.gate.started_at,
                                 max_pick_retries=int(config.get('max_pick_retries',1)),
@@ -1023,6 +1081,7 @@ class Node:
                                     deadline=self.gate.deadline,
                                     event_sink=lambda text: self.record('mission', {'message': text})).run())
         except Exception as exc:
+            self.gate.stop()
             rospy.logerr('Mission preflight failed: %s', exc)
             report['error'] = str(exc)
         finally:
@@ -1042,23 +1101,26 @@ class Node:
                                 'last_measured_arm_pose_mm':runtime.arm_pose,
                                 'pump_may_be_on':bool(runtime.session and runtime.session.pump_may_be_on)}
                     finally:
-                        robot.close()
+                        robot.run_token = None
+                        self._close_robot(robot)
             except Exception as exc:
                 report['stop_or_recording_error'] = str(exc)
                 self.error = str(exc)
             finally:
-                self._close_record_topics()
-                final_state['stop_requested_at'] = self.stop_requested_at
-                self._finish_record(report, final_state)
-                report['run_directory'] = str(self.recorder.path)
-                if self.error:
-                    report['recording_or_stop_error'] = self.error
-                self.report_pub.publish(String(data=json.dumps(report)))
-                rospy.logwarn('Mission %s; delivered=%s; error=%s', report['status'], report.get('delivered'), report['error'])
-                with self.lock:
-                    self.gate.finish(token)
-                    self.robot = robot if getattr(robot,'recovery_required',False) else None
-                    self.publish_state()
+                try:
+                    self._close_record_topics()
+                    final_state['stop_requested_at'] = self.stop_requested_at
+                    self._finish_record(report, final_state)
+                    report['run_directory'] = str(self.recorder.path)
+                    if self.error:
+                        report['recording_or_stop_error'] = self.error
+                    self.report_pub.publish(String(data=json.dumps(report)))
+                    rospy.logwarn('Mission %s; delivered=%s; error=%s',
+                                  report['status'], report.get('delivered'), report.get('error'))
+                finally:
+                    with self.lock:
+                        self.gate.finish(token)
+                        self.publish_state()
 
     def stop(self, msg):
         if msg.data:
@@ -1067,6 +1129,24 @@ class Node:
                 self.prepared = False
                 self.stop_requested_at = time.monotonic()
                 robot = self.robot
+                if self.preparing:
+                    # Only the Prepare worker owns that lifecycle and can close
+                    # a port while its initialization is unwinding.
+                    if robot is not None:
+                        robot.stop_event.set()
+                    self.publish_state()
+                    return
+                worker_active = self.gate.active is not None
+                if not worker_active:
+                    self._close_robot(robot)
+                    if self.recorder and not self.recorder.finished:
+                        self._close_record_topics()
+                        report = {'run_id': self.gate.run_id, 'status': 'cancelled_before_start',
+                                  'error': 'stop before start'}
+                        self._finish_record(report, {'stop_requested_at': self.stop_requested_at})
+                        self.report_pub.publish(String(data=json.dumps(report)))
+                    self.publish_state()
+                    return
             if self.recorder and not self.recorder.finished:
                 try:
                     if self.gate.started_at is not None:
@@ -1076,31 +1156,31 @@ class Node:
                 except Exception as exc:
                     rospy.logerr('Stop recording failed: %s', exc)
             if robot:
-                robot.stop_motion()
-                if self.gate.active is None and not self.preparing:
-                    robot.close()
-                    self.robot = robot if getattr(robot,'recovery_required',False) else None
-            if self.recorder and not self.recorder.finished and self.gate.active is None and not self.preparing:
-                self._close_record_topics()
-                report = {'run_id': self.gate.run_id, 'status': 'cancelled_before_start', 'error': 'stop before start'}
-                self._finish_record(report, {'stop_requested_at': self.stop_requested_at})
-                self.report_pub.publish(String(data=json.dumps(report)))
+                try:
+                    robot.stop_motion()
+                except Exception as exc:
+                    self.error = 'stop request failed: ' + str(exc)
+                    rospy.logerr('%s', self.error)
             self.publish_state()
 
     def release_for_recovery(self, request):
         """Explicit operator recovery after an aborted possible-held state, never a mission step."""
         from std_srvs.srv import TriggerResponse
         with self.lock:
-            if self.gate.active is not None or self.preparing:
+            if self.gate.active is not None or self.preparing or self.prepared:
                 return TriggerResponse(False,'mission worker is still active')
             robot=self.robot
             if not getattr(robot,'recovery_required',False):
                 return TriggerResponse(False,'no retained serial session needs release')
             try:
-                runtime=robot.serial_runtime
-                runtime.session.pump(False,deadline=time.monotonic()+8.)
-                runtime.held=None
-                robot.close();self.robot=None
+                runtime=getattr(robot,'serial_runtime',None)
+                if runtime is not None:
+                    if runtime.session is not None and runtime.session.pump_may_be_on:
+                        runtime.session.pump(False,deadline=time.monotonic()+8.,recovery=True)
+                    runtime.held=None
+                self._close_robot(robot)
+                if self.robot is not None:
+                    return TriggerResponse(False,'serial ownership remains retained')
                 self.publish_state()
                 return TriggerResponse(True,'pump off; retained session closed; reset before preparation')
             except Exception as exc:

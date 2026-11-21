@@ -148,9 +148,7 @@ def inspect_serial_config(config, binding):
         for point in scope.required_points:
             if not finite_vector(config.get('waypoints',{}).get(point),3):
                 issues.append({'code':'waypoint.'+point,'detail':'recorded task station missing'})
-        if int(config.get('max_base_alignments',2)) > 0:
-            geometry.number('arm_yaw_in_base_rad')
-        for key in ('observation_pose_mm','board_observation_pose_mm','transport_pose_mm','empty_travel_pose_mm'):
+        for key in ('observation_pose_mm','transport_pose_mm','empty_travel_pose_mm'):
             geometry.check_pose(geometry.vector(key,3))
         for zone in scope.delivery_zones:
             if geometry.values.get('placement_mode')=='visual_red_zone':continue

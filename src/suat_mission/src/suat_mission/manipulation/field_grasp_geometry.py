@@ -9,20 +9,35 @@ import cv2
 import numpy as np
 
 from suat_mission.manipulation.pickup_geometry import GeometryUnavailable,fit_top_surface
+from suat_mission.vision.experimental_vision import measure_layer
 
 
 class FieldGraspGeometry:
     def __init__(self,geometry):
         self.geometry=geometry
-        self.a=np.asarray(geometry.values['legacy_camera_A'],dtype=float).reshape(3,3)
-        self.b=np.asarray(geometry.values['legacy_camera_B_mm'],dtype=float)
+        values = geometry.values
+        self.method = values.get('geometry_method', 'affine_depth_baseline')
+        if self.method == 'rigid_rgbd':
+            transform = np.asarray(values.get('camera_to_arm_mm'), dtype=float)
+            if transform.shape != (3, 4) or not np.isfinite(transform).all():
+                raise GeometryUnavailable('rigid_rgbd requires a finite 3x4 camera-to-arm transform')
+            rotation = transform[:, :3]
+            if (not np.allclose(rotation.T @ rotation, np.eye(3), atol=.001)
+                    or abs(np.linalg.det(rotation)-1.) > .001):
+                raise GeometryUnavailable('camera_to_arm_mm must be a rigid right-handed transform')
+            self.a = rotation.T
+            self.b = -self.a @ transform[:, 3]
+        else:
+            self.method = 'affine_depth_baseline'
+            self.a=np.asarray(values['legacy_camera_A'],dtype=float).reshape(3,3)
+            self.b=np.asarray(values['legacy_camera_B_mm'],dtype=float)
         self.initial_b=self.b.copy();self.samples=[];self.frozen=False
         self._apply()
 
     def _apply(self):
         inverse=np.linalg.inv(self.a)
         self.geometry.values['camera_to_arm_mm']=np.column_stack((inverse,-inverse@self.b)).tolist()
-        self.geometry.values['geometry_method']='affine_depth_baseline'
+        self.geometry.values['geometry_method']=self.method
 
     @staticmethod
     def camera_points(depth,k,stride=1):
@@ -59,6 +74,9 @@ class FieldGraspGeometry:
         uv=np.array([k[0,0]*predicted[0]/predicted[2]+k[0,2],k[1,1]*predicted[1]/predicted[2]+k[1,2]])
         hsv=cv2.cvtColor(image,cv2.COLOR_BGR2HSV)
         mask=cv2.inRange(hsv,np.array([4,100,60],np.uint8),np.array([25,255,255],np.uint8))
+        # Separate the foreground reference from similarly colored objects before finding contours.
+        reference_depth=np.isfinite(depth)&(depth>0)&(abs(depth-predicted[2])<=120.)
+        mask[~reference_depth]=0
         mask=cv2.morphologyEx(mask,cv2.MORPH_OPEN,np.ones((3,3),np.uint8))
         contours=cv2.findContours(mask,cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE)[-2]
         options=[]
@@ -77,11 +95,12 @@ class FieldGraspGeometry:
             d=float(np.median(valid))
             if abs(d-predicted[2])>120.:continue
             camera=np.array([(u-k[0,2])*d/k[0,0],(v-k[1,2])*d/k[1,1],d])
-            options.append((distance,camera,[float(u),float(v)]))
+            options.append((distance,camera,[float(u),float(v)],max(w,h)/2.))
         options.sort(key=lambda item:item[0])
         if not options or (len(options)>1 and options[1][0]-options[0][0]<15.):
-            return {'state':'unknown','reason':'orange reference not uniquely observed'}
-        _,camera,pixel=options[0]
+            return {'state':'unknown','reason':'orange reference not uniquely observed',
+                    'predicted_pixel':uv.tolist()}
+        error_px,camera,pixel,radius_px=options[0]
         if active.get('phase','').startswith('calibration_view') and not self.frozen:
             if not self.samples or min(math.dist(pose,p) for p,c in self.samples)>=25.:
                 self.samples.append((list(pose),camera.tolist()))
@@ -95,6 +114,7 @@ class FieldGraspGeometry:
         cup=measured-[0.,0.,self.geometry.cup_offset]
         return {'state':'observed','reference':'orange_plate_center_as_legacy_dlt',
                 'pixel':pixel,'reference_arm_mm':measured.tolist(),'cup_point_arm_mm':cup.tolist(),
+                'view_margin_mm':float((radius_px+error_px)*camera[2]/max(k[0,0],k[1,1])),
                 'measured_pose_residual_mm':float(np.linalg.norm(measured-np.asarray(pose)))}
 
     def calibration(self):
@@ -104,21 +124,86 @@ class FieldGraspGeometry:
                 'translation_change_mm':(self.b-self.initial_b).tolist(),
                 'physical_accuracy':'NOT_INDEPENDENTLY_VERIFIED'}
 
+    def observe_layer(self, depth, k, bbox, floor, label):
+        x0, y0, x1, y1 = map(int, bbox)
+        height, width = depth.shape
+        x0, y0, x1, y1 = max(0, x0), max(0, y0), min(width, x1), min(height, y1)
+        patch = depth[y0:y1, x0:x1]
+        if patch.size == 0:
+            return None, None
+        yy, xx = np.mgrid[y0:y1, x0:x1]
+        ax, ay, az, shift = self.geometry.values['camera_to_arm_mm'][2]
+        rise = patch * (ax * (xx - k[0, 2]) / k[0, 0] + ay * (yy - k[1, 2]) / k[1, 1] + az)
+        rise += shift - floor
+        rise[~np.isfinite(patch) | (patch <= 0)] = np.nan
+        block_height = float(self.geometry.values.get('object_height_mm', {}).get(label, 100.0))
+        return measure_layer(rise, (0, 0, patch.shape[1], patch.shape[0]), block_height, block_height)
+
     def surface(self,depth,k,bbox,label,floor,active,tool):
         carrying=(active.get('object_id') and active.get('label')==label and active.get('phase') in
                   ('lift','hold_view','transport','carrying','observe_placement','place_approach',
                    'release_height','withdraw','verify_placement'))
-        expected=None if carrying else floor+(200. if label=='cake' else 100.)
+        expected = None if carrying else self.geometry.expected_pickup_top_z(label, floor)
         aligning=active.get('label')==label and active.get('phase') in ('approach','align_tool','contact')
-        surface=fit_top_surface(depth,k,bbox,self.geometry,label,expected_top_z_mm=expected,require_fit=not (carrying or aligning))
+        surface=fit_top_surface(depth,k,bbox,self.geometry,label,expected_top_z_mm=expected,
+                                require_fit=not (carrying or aligning),
+                                center_top=bool(active.get('center_ordinary_top') and label!='cake'
+                                                and not (carrying or aligning)))
         surface.update(support_z_mm=floor,geometry_revision=2 if self.frozen else 1)
+        if not (carrying or aligning):
+            layer, rise_mm = self.observe_layer(depth, k, bbox, floor, label)
+            # The fitted physical top defines the layer. Print-box depth is diagnostic.
+            surface['observed_layer'] = {'index_from_zero': layer, 'rise_mm': rise_mm}
         if carrying and tool.get('state')=='observed':
             cup=np.asarray(tool['cup_point_arm_mm']);n=np.asarray(surface['plane_normal_arm'])
             point=cup-n*(n@cup-surface['plane_offset_arm_mm'])
-            polygon=np.asarray(surface['support_polygon_arm_mm'],np.float32)[:,:2]
-            if cv2.pointPolygonTest(polygon.reshape(-1,1,2),tuple(point[:2].astype(float)),False)>=0:
+            polygon=np.ascontiguousarray(np.asarray(surface['support_polygon_arm_mm'])[:,:2],dtype=np.float32)
+            if cv2.pointPolygonTest(polygon.reshape(-1,1,2),(float(point[0]),float(point[1])),False)>=0:
                 surface['attachment_point_arm_mm']=point.tolist()
         return surface
+
+    def locked_top(self, depth, k, reference, label):
+        """Refit the remaining top of the selected stationary block from this depth frame."""
+        polygon=np.asarray(reference['polygon_px'],dtype=np.int32)
+        if (reference['image_size']!=[depth.shape[1],depth.shape[0]]
+                or polygon.ndim!=2 or polygon.shape[1]!=2 or len(polygon)<3):
+            raise GeometryUnavailable('saved top contour does not match this image')
+        x,y,w,h=cv2.boundingRect(polygon)
+        mask=np.zeros(depth.shape,dtype=np.uint8)
+        cv2.fillPoly(mask,[polygon],1)
+        expected=float(reference['top_z_mm'])
+        surface=fit_top_surface(np.where(mask,depth,0.),k,(x,y,x+w,y+h),self.geometry,label,
+                                expected_top_z_mm=expected,require_fit=False)
+        return {key:surface[key] for key in ('plane_normal_arm','plane_offset_arm_mm','support_pixels')}
+
+    def raised_payload_depth(self, depth, k, cup_arm_mm, label):
+        """Use the measured depth of the payload below the cup, including tilted blocks."""
+        values = self.geometry.values
+        width = float(values.get('object_width_mm', {}).get(label, 100.))
+        height = float(values.get('object_height_mm', {}).get(label, 100.))
+        gap = float(values.get('height_tolerance_mm', 12.))
+        radius = width / math.sqrt(2.) + self.geometry.cup_radius
+        cup = np.asarray(cup_arm_mm, dtype=float)
+        raw = depth[::2,::2]
+        valid = np.isfinite(raw) & (raw > 0.)
+        arm = (self.camera_points(depth,k,2)-self.b) @ np.linalg.inv(self.a).T
+        relative = arm-cup
+        mask = np.zeros(raw.shape,np.uint8)
+        mask[valid] = ((abs(relative[:,0])<=radius)&(abs(relative[:,1])<=radius)
+                       &(relative[:,2]<=-gap)&(relative[:,2]>=-height-gap))
+        connected = cv2.morphologyEx(mask,cv2.MORPH_CLOSE,np.ones((3,3),np.uint8))
+        count, ids, stats, _ = cv2.connectedComponentsWithStats(connected,8)
+        for component in sorted(range(1,count),key=lambda i:-stats[i,cv2.CC_STAT_AREA]):
+            cluster = arm[(ids[valid]==component)&(mask[valid]!=0)]
+            if len(cluster)<int(values.get('gripper_min_rays',30)):
+                continue
+            lo,hi = np.percentile(cluster,[5.,95.],axis=0)
+            if np.any((hi-lo)[:2]<width*.4):
+                continue
+            center = np.median(cluster,axis=0)
+            center[2] = hi[2]
+            return {'point_arm_mm':center.tolist(),'support_pixels':len(cluster)}
+        raise GeometryUnavailable('no block-sized raised depth component below the cup')
 
     def placement(self,image,depth,k,active,objects,floor):
         zone=active.get('zone')

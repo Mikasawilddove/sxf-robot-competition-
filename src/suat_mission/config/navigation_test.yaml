@@ -1,5 +1,7 @@
 # Candidate for the first unloaded field test; not a validated competition speed.
 controller_frequency: 10.0
+# Phase timeouts are resolved above move_base in NavigationBudget.
+# These plugin patience limits describe local planner recovery behavior.
 controller_patience: 3.0
 planner_frequency: 1.0
 planner_patience: 3.0
@@ -7,7 +9,7 @@ make_plan_clear_costmap: false
 make_plan_add_unreachable_goal: false
 oscillation_timeout: 8.0
 oscillation_distance: 0.10
-base_global_planner: navfn/NavfnROS
+base_global_planner: global_planner/GlobalPlanner
 base_local_planner: dwa_local_planner/DWAPlannerROS
 # No automatic spinning or obstacle-clearing recovery in the first test.
 recovery_behavior_enabled: false
@@ -45,6 +47,12 @@ DWAPlannerROS:
 NavfnROS:
   allow_unknown: false
   default_tolerance: 0.0
+GlobalPlanner:
+  allow_unknown: false
+  use_dijkstra: true
+  # GridPath failed to extract a route from the recorded near-board pose.
+  # GradientPath passed the same start/goal and footprint checks on the robot.
+  use_grid_path: false
 global_costmap:
   global_frame: map
   robot_base_frame: base_footprint

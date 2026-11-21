@@ -2,6 +2,8 @@
   <!-- Minimal field stack: no camera driver, arm driver, command source or task. -->
   <arg name="workspace_root" default="/home/spark/SUAT/spark"/>
   <arg name="map_file"/>
+  <arg name="field_transform" default=""/>
+  <arg name="field_alignment_version" default=""/>
   <arg name="settle_initialization" default="false"/>
   <arg name="initial_pose_x"/>
   <arg name="initial_pose_y"/>
@@ -29,4 +31,8 @@
     <arg name="initial_cov_yy" value="$(arg initial_cov_yy)"/>
     <arg name="initial_cov_aa" value="$(arg initial_cov_aa)"/>
   </include>
+  <node if="$(eval arg('field_transform') != '')" pkg="tf2_ros"
+        type="static_transform_publisher" name="suat_field_alignment" args="$(arg field_transform)">
+    <param name="alignment_version" value="$(arg field_alignment_version)"/>
+  </node>
 </launch>

@@ -2,10 +2,14 @@
 execution_backend: serial_rgbd
 pickup_geometry_file: data/calibration/field_20261117/pickup_geometry_visual_20261119.yaml
 recorded_route_file: data/navigation/recorded_stations_20261115.json
-board_station_records_file: data/waypoints/corner_20261115_A_03_candidates.json
 additional_waypoints_file: data/waypoints/collection_bcd_candidates_20261117.json
 board_geometry_file: data/calibration/board_view_candidates/classification_arrival_20261115_03_v1.json
-arm_feed_mm_min: 1000.0 # 沿用连续串口执行器的值；不是已确认的固件最高速度
+# 当前 640x480 相机画面下的候选四角（左上、右上、右下、左下）。
+# 仅适用于目前观察姿态；相机、机器人或板面移动后需要重新核对。
+board_view_candidate:
+  geometry_id: classification_view_20261119_camera_candidate
+  image_size: [640, 480]
+  corners: [[35, 120], [485, 65], [510, 165], [35, 240]]
 max_base_alignments: 2
 max_base_adjustment_mm: 100.0
 base_alignment_tolerance_m: 0.01 # 软件请求，不代表底盘已经实测达到1cm
@@ -13,7 +17,6 @@ manipulation_confirm_frames: 2
 holding_observation_timeout: 2.0
 max_pick_retries: 1
 allow_cake_degradation: true
-allow_transport_zone_fallback: true # 普通块；仅在该区已有实录运输区槽位/边界时生效，A蛋糕不降级落区。
 initial_cycle_budget_seconds: 120.0 # 首轮估计；之后用实际完成循环耗时更新
 # 以下开关仅供旧topic后端保留，不作为serial_rgbd的虚假就绪声明。
 hardware_ready: false
@@ -37,17 +40,18 @@ target_frames: 5
 target_min_frames: 3
 target_max_distance_px: 35.0
 target_roi: []
+# 单蛋糕走已录路线的西侧站。四侧接近站只在显式选择的 full 配置中使用。
 sorting_points: [Sorting_W]
 each_count: 3
 mission_timeout: 600.0
-judge_clock_already_running: false # development trial default; not a measured timing value
-startup_delay: 0.0 # development trial default; not a measured timing value
-stop_margin: 1.0 # development trial default; not a measured timing value
+judge_clock_already_running: false # explicitly choose whether the judge clock is running at preparation
+startup_delay: 0.0 # seconds already consumed at preparation (judge running), or known Enter delay otherwise
+stop_margin: 1.0 # measured/conservative stopping reserve; null blocks preparation until confirmed
 record_max_hz: 10.0 # sampled per allowlisted topic; recording load still requires on-site verification
 record_max_bytes: 1048576
 action_timeout: 60.0 # 单次导航/抓取/放置的上限，仍受整场截止约束
 observation_max_age: 2.0
-navigation_speed: slow # 与唯一导航owner所启用的停车后档位一致；不是现场已验收档位。
+navigation_speed: fast
 navigation_timeout: 60.0
 feedback_timeout: 15.0
 observation_timeout: 5.0
@@ -79,3 +83,9 @@ board_detector_source: '' # 核实正式生产链后填formal_template或formal_
 board_detector_publisher: '' # /objects实际callerid；未知或与收到消息不符时拒绝投票。
 board_image_topic: /camera/color/image_raw # 沿用已跑过的原图入口；实际接线由相机端确认
 board_score_semantics: '' # 普通板图案正式模板分数须为TM_CCOEFF_NORMED。
+
+# 现场临时规避（2026-11-17）：recorder 以 AnyMsg 订阅与 Navigator 的 String 订阅同话题时，
+# 本进程内 Navigator.on_state 收到 AnyMsg 导致 fresh output state missing。
+# 暂从记录清单移除 /suat/navigation/state，其余仍记录；待核心端修类型/顺序后删除本覆盖。
+record_topics: ['/suat/mission/command', '/suat/mission/stop', '/suat/perception/instances', '/suat/manipulation/active', '/move_base/result', '/cmd_vel', '/suat/navigation/raw_cmd_vel', '/suat/navigation/smoothed_cmd_vel']
+board_station_records_file: data/waypoints/corner_20261115_A_03_candidates.json

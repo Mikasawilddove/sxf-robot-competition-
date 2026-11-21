@@ -10,6 +10,11 @@ PLANNING_MAP_TOPIC = '/suat/navigation/planning_map'
 KEEP_OUT_FILE = 'data/navigation/central_pickup_keepout.json'
 
 
+def is_pickup_station(keepout, name):
+    return (keepout is not None and keepout.precise_pickup
+            and name in ('Sorting_W','Sorting_S','Sorting_E','Sorting_N'))
+
+
 class PickupKeepout:
     def __init__(self, record, binding):
         validate_map_identity(record, binding)
@@ -22,10 +27,12 @@ class PickupKeepout:
         self.center = tuple(xy)
         self.c, self.s = math.cos(angle), math.sin(angle)
         self.half = size / 2 + padding
+        self.precise_pickup = record.get('rasterize_brick_array_only') is True
+        self.raster_half = size / 2 if self.precise_pickup else self.half
 
     @classmethod
-    def load(cls, root, binding):
-        return cls(json.loads((Path(root)/KEEP_OUT_FILE).read_text(encoding='utf-8')), binding)
+    def load(cls, root, binding, filename=KEEP_OUT_FILE):
+        return cls(json.loads((Path(root)/filename).read_text(encoding='utf-8')), binding)
 
     def relative(self, point):
         x, y = point[0]-self.center[0], point[1]-self.center[1]
@@ -64,11 +71,12 @@ class PickupKeepout:
         ox, oy = grid['origin']
         r, width = grid['resolution'], grid['width']
         values = list(grid['data'])
-        extent = self.half*(abs(self.c)+abs(self.s))
+        extent = self.raster_half*(abs(self.c)+abs(self.s))
         x0, x1 = (math.floor((self.center[0]+s*extent-ox)/r) for s in (-1.,1.))
         y0, y1 = (math.floor((self.center[1]+s*extent-oy)/r) for s in (-1.,1.))
         for j in range(max(0,y0),min(grid['height']-1,y1)+1):
             for i in range(max(0,x0),min(width-1,x1)+1):
-                if self.distance((ox+(i+.5)*r,oy+(j+.5)*r)) == 0:
+                x,y = self.relative((ox+(i+.5)*r,oy+(j+.5)*r))
+                if max(abs(x),abs(y)) <= self.raster_half:
                     values[j*width+i] = 100
         return dict(grid,data=values)

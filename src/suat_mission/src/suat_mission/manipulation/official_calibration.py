@@ -22,6 +22,7 @@ def load_profile(filename):
         top=plane.get('top_z_mm')
         if top is not None and (type(top) not in (int,float) or not math.isfinite(top)):
             raise ValueError('official plane top_z_mm must be a measured number or null for comparison only')
+        contact_z=plane.get('contact_z_mm')
         labels=plane.get('labels')
         if not isinstance(labels,list) or not labels or any(
                 label not in ('cake','clock','teddybear','banana') for label in labels):
@@ -37,8 +38,11 @@ def load_profile(filename):
         if size is not None and (not isinstance(size,list) or len(size)!=2 or
                                  any(type(v) is not int or v<=0 for v in size)):
             raise ValueError('official plane image_size must be calibrated [width,height]')
+        if contact_z is not None and (top is None or size is None or
+                                      type(contact_z) not in (int,float) or not math.isfinite(contact_z)):
+            raise ValueError('contact_z_mm requires a finite arm value and calibrated height and image size')
         stat=source.stat()
-        models.append({'labels':labels,'top_z_mm':top,'image_size':size,
+        models.append({'labels':labels,'top_z_mm':top,'image_size':size,'contact_z_mm':contact_z,
                        'coefficients':[calibration.kx,calibration.bx,calibration.ky,calibration.by],
                        'source_file':str(source),'source_size_bytes':stat.st_size,
                        'source_mtime_ns':stat.st_mtime_ns})
@@ -80,6 +84,7 @@ def project_top(values,label,pixel,observed_top_z,image_size,require_height=True
     x,y=calibration.project(*pixel)
     return [x,y,observed_top_z],{'source':'official_planar','source_file':model['source_file'],
         'coefficients':model['coefficients'],'top_z_mm':model['top_z_mm'],
+        'contact_z_mm':model.get('contact_z_mm'),
         'observed_top_z_mm':observed_top_z,'grasp_pixel':list(pixel),
         'height_applicable':model['top_z_mm'] is not None and abs(model['top_z_mm']-observed_top_z)<=tolerance,
         'physical_accuracy':official['physical_accuracy']}

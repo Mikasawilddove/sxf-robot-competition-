@@ -15,6 +15,7 @@ import select
 import shutil
 import struct
 import subprocess
+import tempfile
 import termios
 import time
 import threading
@@ -22,6 +23,7 @@ import xmlrpc.client
 
 import rospy
 from suat_mission.manipulation.arm_feedback import SwiftProParser
+from suat_mission.manipulation.arm_path import travel_dwell
 from suat_mission.manipulation.arm_recovery import matched_reply_or_fault, recover_pose
 from suat_mission.contracts import ActionContext
 
@@ -67,20 +69,23 @@ class SerialPort:
 
 class ArmSession:
     """Serial backend retained across all empty and loaded arm motions."""
+    READ_ONLY = frozenset(('P2234', 'P2231', 'P2200', 'M2200', 'M2221', 'M2222'))
+
     def __init__(self, run_dir, feed=1000.):
         self.run = Path(run_dir)
         self.feed = feed
-        self.fast_feed=feed
-        self.contact_feed=feed
-        self.correction_feed=min(feed,1000.)
         self.correction_tolerance_mm=5.
         self.port = None
         self.paused = False
         self.pump_may_be_on = False
+        self.startup_pump_unread = False
         self.handle = None
+        self.owner_fd = None
+        self.initialized = False
         self.sequence = 0
         self.active_deadline = None
         self.permitted = None
+        self.write_if_running = None
         self.parser = SwiftProParser()
         self.records = []
         self.io_lock = threading.RLock()
@@ -97,25 +102,49 @@ class ArmSession:
         self.records.append({'time': at, 'received_base64': base64.b64encode(data).decode()})
         return self.parser.feed(data, at)
 
-    def ask(self, command, timeout=2.):
+    def ask(self, command, timeout=2., *, numbered=True, recovery=False):
         with self.io_lock:
-            return self._ask(command,timeout)
+            return self._ask(command,timeout,numbered,recovery)
 
-    def _ask(self, command, timeout):
-        if (self.permitted is not None and command.startswith(('G0 ', 'M2231 V1'))
-                and not self.permitted()):
+    def _ask(self, command, timeout, numbered, recovery):
+        if not command.split() or '\r' in command or '\n' in command:
+            raise ValueError('one serial command is required')
+        if recovery and command != 'M2231 V0':
+            raise ValueError('only pump off is supported for explicit recovery')
+        guarded = (command.split()[0] not in self.READ_ONLY
+                   and command not in ('M2000', 'M2120 V0') and not recovery)
+        if guarded and self.permitted is not None and not self.permitted():
             raise RuntimeError('competition action was stopped before arm command')
-        self.sequence += 1
-        sequence = self.sequence
+        if guarded and command != 'M17' and not self.initialized:
+            raise RuntimeError('arm motion must be initialized before task commands')
+        if numbered:
+            self.sequence += 1
+            sequence = self.sequence
+            wire = '#%d %s' % (sequence, command)
+        else:
+            sequence = None
+            wire = command
         at = self.now()
         deadline = at + timeout
         if self.active_deadline is not None and command != 'M2000':
             deadline = min(deadline, self.active_deadline)
         if at >= deadline:
             raise TimeoutError('arm action deadline reached')
-        self.records.append({'time': at, 'sequence': sequence, 'command': command})
-        self.handle.write(('#%d %s\r\n' % (sequence, command)).encode('ascii'))
+        def transmit():
+            if self.now() >= deadline:
+                raise TimeoutError('arm action deadline reached')
+            self.records.append({'time': at, 'sequence': sequence, 'command': command})
+            if command.split() == ['M2231', 'V1']:
+                self.pump_may_be_on = True  # A partial write can also turn on suction.
+            self.handle.write((wire + '\r\n').encode('ascii'))
+
+        if guarded and self.write_if_running is not None:
+            self.write_if_running(transmit)
+        else:
+            transmit()
         while self.now() < deadline:
+            if guarded and self.permitted is not None and not self.permitted():
+                raise RuntimeError('competition action was stopped while waiting for arm reply')
             frame = matched_reply_or_fault(self._receive(), sequence, at)
             if frame is not None:
                 self.records.append({'time': self.now(), 'reply': asdict(frame)})
@@ -131,12 +160,61 @@ class ArmSession:
             raise ValueError('invalid arm numeric reply')
         return values
 
-    def open(self):
+    def _claim_port(self):
+        # Lock before opening the tty. A competing open can reset the controller.
+        device = Path(self.port).resolve().name
+        path = Path(tempfile.gettempdir()) / ('suat-arm-' + device + '.lock')
+        fd = os.open(path, os.O_CREAT | os.O_RDWR | getattr(os, 'O_NOFOLLOW', 0), 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BaseException:
+            os.close(fd)
+            raise
+        self.owner_fd = fd
+
+    def _release_port(self):
+        if self.owner_fd is not None:
+            fd, self.owner_fd = self.owner_fd, None
+            os.close(fd)
+
+    def open(self, *, preparing=False, check_preparing=None):
+        def check():
+            if check_preparing is not None:
+                check_preparing()
+
+        with self.io_lock:
+            check()
+            if self.handle is None:
+                if self.owner_fd is not None:
+                    raise RuntimeError('previous serial initialization requires cleanup')
+                try:
+                    self._open_port(check)
+                except BaseException:
+                    if self.handle is None and not self.paused:
+                        self._release_port()
+                    raise
+            if not preparing:
+                self.enable_motion()
+
+    def enable_motion(self):
+        with self.io_lock:
+            if not self.initialized:
+                # A pose read during Prepare can leave an expired action
+                # deadline. Start uses the current run deadline and reply limit.
+                self.active_deadline = None
+                self.ask('M17')
+                if self.values(self.ask('M2200'), 'V') != [0.]:
+                    raise RuntimeError('arm did not become idle after initialization')
+                self.initialized = True
+
+    def _open_port(self, check):
         source = Path('/home/spark/spark_noetic/src/spark_driver/arm/uArm/swiftpro/src/swiftpro_write_node.cpp')
         ports = re.findall(r'_serial\.setPort\("([^"\n]+)"\)', source.read_text())
         if len(ports) != 1 or not shutil.which('fuser'):
             raise RuntimeError('cannot identify the existing arm serial port')
         self.port = ports[0]
+        self._claim_port()
+        check()
         state = self.master.getSystemState(rospy.get_name())[2]
         publishers = dict(state[0])
         topics = ('position_write_topic', 'swiftpro_status_topic', 'angle4th_topic', 'gripper_topic', 'pump_topic')
@@ -146,30 +224,40 @@ class ArmSession:
         if code == 1:
             owner = xmlrpc.client.ServerProxy(uri)
             pid = owner.getPid(rospy.get_name())[2]
+            check()
             owner.shutdown(rospy.get_name(), 'one continuous measured arm session')
             self.paused = True
             until = self.now() + 4
             while Path('/proc/%d' % pid).exists() and self.now() < until:
+                check()
                 time.sleep(.05)
             if Path('/proc/%d' % pid).exists():
                 raise RuntimeError('old arm owner did not exit')
-        held = subprocess.run(['fuser', self.port], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        held = subprocess.run(['fuser', self.port], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=3)
         if held.returncode != 1 or held.stdout.strip():
             raise RuntimeError('arm serial device still in use')
+        check()
         self.handle = SerialPort(self.port)
         # Until the device reports its state, do not assume suction is off.
         self.pump_may_be_on = True
+        self.startup_pump_unread = True
         until = self.now() + 4
         while self.now() < until:
+            check()
             self._receive()
         self.sequence = int(self.now() * 1000) % 100000000 + 1000
         if self.values(self.ask('P2234'), 'V') != [1.]:
             raise RuntimeError('arm power not present')
-        if self.values(self.ask('P2231'), 'V') != [0.]:
+        self.pump_may_be_on = self.values(self.ask('P2231'), 'V') != [0.]
+        self.startup_pump_unread = False
+        if self.pump_may_be_on:
             raise RuntimeError('pump not off at mission start')
-        self.pump_may_be_on = False
+        check()
         if self.values(self.ask('M2200'), 'V') != [0.]:
             raise RuntimeError('arm already moving')
+        # Disable periodic telemetry here. Servo attach waits for Start.
+        check()
+        self.ask('M2120 V0')
         self.records.append({'time': self.now(), 'event': 'CONTINUOUS_SESSION_OPEN'})
 
     def validate_target(self, xyz, deadline):
@@ -185,77 +273,73 @@ class ArmSession:
                 'joint_sequence': joint.sequence, 'fk_sequence': fk.sequence,
                 'joint_received_at': joint.received_at, 'received_at': fk.received_at}
 
-    def move(self, xyz, deadline):
+    def move(self, xyz, deadline, *, start_pose=None):
         self.active_deadline = deadline
         if self.values(self.ask('M2200'), 'V') != [0.]:
             raise RuntimeError('arm moving before a new command')
-        start = self.read_pose(deadline)['xyz']
-        self.ask('M2000')
+        start = (start_pose if start_pose is not None else self.read_pose(deadline))['xyz']
         started = self.now()
-        self.ask('G0 X%.4f Y%.4f Z%.4f F%.0f' % (*xyz, self.feed), timeout=30)
-        # Firmware idle can precede physical settling; avoid interrupting a move
-        # merely because three rapid M2200 queries returned idle.
-        table=((1000.,20.),(10000.,44.3),(40000.,78.7),(80000.,95.4))
-        speed=table[-1][1]
-        if self.feed<=table[0][0]:speed=table[0][1]
-        else:
-            for (f0,s0),(f1,s1) in zip(table,table[1:]):
-                if self.feed<=f1:
-                    speed=s0+(s1-s0)*(self.feed-f0)/(f1-f0);break
-        # Use the measured feed table, not F/60: this firmware saturates.
-        earliest_settled = started + max(.45,math.dist(start,xyz)/speed+.55)
-        idle_count = 0
-        previous = None
+        # The stock writer and the successful field unfold use this bare G0.
+        self.ask('G0 X%.2f Y%.2f Z%.2f F%.0f' % (*xyz, self.feed), timeout=30, numbered=False)
+        earliest_settled = started + travel_dwell(math.dist(start,xyz), self.feed)
+        moved = False
         while self.now() < deadline:
-            measured = self.read_pose(deadline)['xyz']
-            moving = self.values(self.ask('M2200'), 'V')[0]
-            stable = previous is not None and math.dist(measured, previous) < 1.
-            idle_count = idle_count + 1 if moving == 0 and stable and self.now() >= earliest_settled else 0
-            if idle_count >= 3:
-                return
-            previous = measured
-            time.sleep(.1)
-        raise TimeoutError('arm did not settle before deadline')
+            if self.permitted is not None and not self.permitted():
+                raise RuntimeError('competition action was stopped during arm travel')
+            moving = self.values(self.ask('M2200'), 'V') != [0.]
+            moved = moved or moving
+            if not moving and (moved or self.now() >= earliest_settled):
+                feedback = self.read_pose(deadline)
+                if (math.dist(feedback['xyz'], xyz) <= self.correction_tolerance_mm
+                        or self.now() >= earliest_settled):
+                    return feedback
+            time.sleep(.05)
+        raise TimeoutError('arm did not finish the command before deadline')
 
     def stop(self, deadline):
-        self.active_deadline = deadline
-        frame = self.ask('M2000')
-        idle = self.values(self.ask('M2200'), 'V') == [0.]
-        return {'acknowledged': frame.kind == 'reply', 'controller_idle': idle, 'stop_sequence': frame.sequence}
+        with self.io_lock:
+            if self.handle is None:
+                return {'acknowledged': False, 'controller_idle': False}
+            self.active_deadline = deadline
+            frame = self.ask('M2000')
+            idle = self.values(self.ask('M2200'), 'V') == [0.]
+            return {'acknowledged': frame.kind == 'reply', 'controller_idle': idle, 'stop_sequence': frame.sequence}
 
-    def go(self, stage, xyz, *, loaded=False, deadline=None):
+    def go(self, stage, xyz, *, loaded=False, deadline=None, target_prevalidated=False):
         end=min(self.now()+75., deadline) if deadline is not None else self.now()+75.
         ctx = ActionContext(self.run.name, stage, 'arm_pose', '', 0, end)
-        self.feed=self.contact_feed if stage in ('contact','lift','release_height') else self.fast_feed
-        if not self.validate_target(xyz,end):raise RuntimeError(stage+': controller IK rejected target')
-        initial=self.read_pose(end)['xyz']
-        if math.dist(initial,xyz)>self.correction_tolerance_mm:
-            self.move(xyz,end-3.)
-        # Long travel may be fast. Small measured corrections retain the only
-        # feed that converged in the field report, inside the same session.
-        self.feed=self.correction_feed
-        result = recover_pose(self, xyz, ctx, tolerance_mm=self.correction_tolerance_mm, max_moves=3,
-                              stop_budget_s=3., max_correction_step_mm=5. if loaded else 10.,
-                              max_command_offset_mm=10. if loaded else 25.)
-        self.active_deadline = None
-        self.records.append({'event': 'POSE_RESULT', 'stage': stage, 'loaded': loaded, 'result': result})
+        try:
+            result = recover_pose(self, xyz, ctx, tolerance_mm=self.correction_tolerance_mm,
+                                  max_moves=1, stop_budget_s=3., stop_after_success=False,
+                                  target_prevalidated=target_prevalidated,
+                                  move_with_feedback=self.move)
+        finally:
+            self.active_deadline = None
+        self.records.append({'event': 'POSE_RESULT', 'stage': stage, 'loaded': loaded,
+                             'requested_feed_mm_min': self.feed,
+                             'travel_feed_mm_min': self.feed, 'result': result})
         if result['outcome'] != 'measured_target_reached':
-            raise RuntimeError(stage + ': ' + result.get('error', 'measured pose did not reach target'))
+            error = result.get('error', 'measured pose did not reach target')
+            if result.get('final_error_mm') is not None:
+                error += ' (measured error %.1f mm)' % result['final_error_mm']
+            raise RuntimeError(stage + ': ' + error)
         return result
 
-    def pump(self, on, *, deadline=None):
+    def pump(self, on, *, deadline=None, recovery=False, wait_for_current=True):
         self.active_deadline = deadline
-        if on:
-            self.pump_may_be_on = True  # possible write must not be mistaken for off
-        self.ask('M2231 V%d' % (1 if on else 0))
-        settled=self.now()+(2.5 if on else 3.)
-        while self.now()<settled:
-            if deadline is not None and self.now()>=deadline:
-                raise TimeoutError('pump action deadline reached')
+        self.ask('M2231 V%d' % (1 if on else 0), recovery=recovery)
+        if on and not wait_for_current:
+            return
+        end = self.now()+(2.5 if on else 3.)
+        if deadline is not None:
+            end = min(end, deadline)
+        while True:
+            raw = self.values(self.ask('P2231'), 'V')[0]
+            if bool(raw) == on or self.now() >= end:
+                break
             if on and self.permitted is not None and not self.permitted():
                 raise RuntimeError('pump action interrupted; holding remains uncertain')
             time.sleep(.05)
-        raw = self.values(self.ask('P2231'), 'V')[0]
         self.records.append({'event': 'PUMP_CURRENT', 'requested_on': on, 'value': raw,
                              'interpretation': 'pump current only; holding not established'})
         if on and raw == 0:
@@ -268,6 +352,10 @@ class ArmSession:
 
     def close(self):
         """Do not restart the serial driver if an object might still be held."""
+        with self.io_lock:
+            return self._close()
+
+    def _close(self):
         status = {'pump_may_be_on': self.pump_may_be_on, 'factory_restored': False}
         if self.handle is not None:
             try:
@@ -275,9 +363,22 @@ class ArmSession:
                 self.ask('M2000')
             except Exception as exc:
                 status['stop_error'] = str(exc)
+            if self.startup_pump_unread:
+                try:
+                    self.pump_may_be_on = self.values(self.ask('P2231'), 'V') != [0.]
+                    self.startup_pump_unread = False
+                    status['pump_may_be_on'] = self.pump_may_be_on
+                except Exception as exc:
+                    status['startup_pump_query_error'] = str(exc)
             if not self.pump_may_be_on:
                 self.handle.close()
                 self.handle = None
+                self.initialized = False
+        if self.paused and not self.pump_may_be_on and self.write_if_running is not None:
+            # The factory driver sends M17 when launched. In a formal session
+            # teardown must release ownership without restarting that driver.
+            self.paused = False
+            status['factory_restart_deferred'] = True
         if self.paused and not self.pump_may_be_on:
             held = subprocess.run(['fuser', self.port], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=3)
             if held.returncode != 1 or held.stdout.strip():
@@ -288,5 +389,8 @@ class ArmSession:
             time.sleep(4)
             status.update(factory_restored=proc.poll() is None, factory_pid=proc.pid)
             if status['factory_restored']:self.paused=False
+        if self.handle is None and not self.paused:
+            self._release_port()
+        status['ownership_retained'] = self.owner_fd is not None
         (self.run / 'arm_serial_trace.json').write_text(json.dumps(self.records, indent=2), encoding='utf-8')
         return status

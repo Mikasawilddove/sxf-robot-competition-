@@ -81,11 +81,22 @@ class RunGate:
 
     def permitted(self, token):
         with self._lock:
-            return self.active == token and self.state == 'running'
+            return self._permitted(token)
+
+    def _permitted(self, token):
+        return (bool(token) and self.active == token and self.state == 'running'
+                and self.deadline is not None and self.clock() < self.deadline)
+
+    def write_if_running(self, token, write):
+        """Serialize one bounded device write with revocation, not its reply wait."""
+        with self._lock:
+            if not self._permitted(token):
+                raise RuntimeError('arm command requires an active run token')
+            write()
 
     def finish(self, token):
         with self._lock:
-            if self.active != token:
+            if not token or self.active != token:
                 return False
             self.active = None
             if self.state == 'running':
