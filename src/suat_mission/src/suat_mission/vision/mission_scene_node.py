@@ -73,6 +73,22 @@ class SceneNode:
             with self.lock:self.active=value
         except ValueError:pass
 
+    def payload_evidence(self, depth, k, active, tool):
+        hand = {'state':'unknown','evidence':'tool or calibrated view unavailable'}
+        raised = None
+        if self.geometry.values.get('refine_translation_at_start') and not self.measurement.frozen:
+            return hand, raised
+        if tool.get('state') == 'observed':
+            hand = observe_payload_volume(depth,k,self.geometry,tool['reference_arm_mm'],
+                active.get('label',''),active.get('object_id',''))
+        if active.get('payload_cup_arm_mm'):
+            try:
+                raised = self.measurement.raised_payload_depth(depth,k,active['payload_cup_arm_mm'],active['label'])
+                raised['object_id'] = active['object_id']
+            except GeometryUnavailable:
+                pass
+        return hand, raised
+
     def associate(self,label,position,point,active,used):
         selected=active.get('object_id');phase=active.get('phase','')
         carrying=phase in ('lift','hold_view','transport','carrying','observe_placement','place_approach',
@@ -121,6 +137,13 @@ class SceneNode:
                 if min(stamp,depth_msg.header.stamp.to_sec())<float(active.get('stamp',0.)):return
                 tool=self.measurement.observe_tool(image,depth,k,active)
             hand={'state':'unknown','evidence':'tool or calibrated view unavailable'}
+            if active.get('phase') == 'carrying' and active.get('payload_cup_arm_mm'):
+                # This observation is in arm coordinates. Floor fitting, map TF
+                # and template detection are needed again at the release station.
+                hand, raised = self.payload_evidence(depth, k, active, tool)
+                if self.publish_scene(color,[],tool,hand,None,None,camera_model,raised_payload=raised):
+                    self.overlay.render(color,image,active,[],set(),tool,hand,None,None,None)
+                return
             if active.get('phase','').startswith('calibration_view_'):
                 if self.publish_scene(color,[],tool,hand,None,None,camera_model):
                     self.overlay.render(color,image,active,[],set(),tool,hand,None,None,None)
@@ -187,18 +210,7 @@ class SceneNode:
                     and math.dist(other['surface']['arm_xyz_mm'][:2],p[:2])<60.]
                 if obj['occluded_by']:obj['graspable']=False
             placement=self.measurement.placement(image,depth,k,active,objects,floor)
-            calibration_ready = self.measurement.frozen or not self.geometry.values.get('refine_translation_at_start')
-            raised = None
-            if calibration_ready and tool.get('state')=='observed':
-                # Volume rays are anchored to the observed tool using the same DLT as the frame.
-                hand=observe_payload_volume(depth,k,self.geometry,tool['reference_arm_mm'],
-                    active.get('label',''),active.get('object_id',''))
-            if calibration_ready and active.get('payload_cup_arm_mm'):
-                try:
-                    raised=self.measurement.raised_payload_depth(depth,k,active['payload_cup_arm_mm'],active['label'])
-                    raised['object_id']=active['object_id']
-                except GeometryUnavailable:
-                    pass
+            hand, raised = self.payload_evidence(depth, k, active, tool)
             if self.publish_scene(color,objects,tool,hand,placement,floor,camera_model,raised_payload=raised):
                 accepted={o['object_id'] for o in objects if o['support_frames']>=self.target_min_frames}
                 self.overlay.render(color,image,active,diagnostics,accepted,tool,hand,placement,None,floor)

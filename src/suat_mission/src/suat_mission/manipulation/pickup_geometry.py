@@ -107,11 +107,19 @@ class PickupGeometry:
                       if evidence['selected_source'] == 'official-planar' else None)
         return [point[0], point[1], point[2]+self.cup_offset if measured_z is None else measured_z]
 
+    def grasp_source(self, label):
+        if label in self.values.get('rgbd_pickup_labels', ()):
+            return 'rgbd-top'
+        return self.values.get('grasp_xy_source','dlt')
+
     def grasp_projection(self, detection):
         """Select only contact XY; RGB-D surface/height/holding checks remain."""
         point=self.point(detection)
-        evidence={'selected_source':self.values.get('grasp_xy_source','dlt'),
-                  'dlt_point_arm_mm':point,'calibration_id':self.calibration_id}
+        evidence={'selected_source':self.grasp_source(detection.label),'calibration_id':self.calibration_id}
+        if evidence['selected_source'] == 'rgbd-top':
+            evidence['rgbd_point_arm_mm'] = point
+            return point, evidence
+        evidence['dlt_point_arm_mm'] = point
         if self.values.get('official_planar'):
             from suat_mission.manipulation.official_calibration import project_top
             try:
@@ -160,9 +168,9 @@ class PickupGeometry:
     def pickup_options(self, detection):
         """Keep the measured central point first, then other supported cup placements."""
         yield detection
-        source = self.values.get('grasp_xy_source','dlt')
+        source = self.grasp_source(detection.label)
         if (self.values.get('reachable_top_selection') is not True
-                or not (source == 'dlt' or (source == 'official-planar' and detection.label == 'cake'))):
+                or not (source in ('dlt', 'rgbd-top') or (source == 'official-planar' and detection.label == 'cake'))):
             return
         from dataclasses import replace
         for option in detection.surface.get('alternate_suction_points', ()):

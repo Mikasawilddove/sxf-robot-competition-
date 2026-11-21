@@ -610,13 +610,12 @@ class SerialRosRobot(RosRobot):
         if kind != 'objects':
             return
         runtime = self.serial_runtime
-        use_left_view = (self.scope.name == 'cake-only'
-                         and runtime.geometry.values.get('cake_pickup_view_left_mm') is not None)
-        if not self._pickup_prepared or use_left_view:
+        left_view = runtime.geometry.values.get('cake_pickup_view_left_mm')
+        if not self._pickup_prepared or left_view is not None:
             deadline = min(self.deadline, time.monotonic()+float(self._param('action_timeout',60.)))
             runtime.prepare_empty_observation(
                 self._param('arm_unfold_pose_mm', (191.74, -0.30, 124.09)), deadline,
-                left_view=runtime.geometry.values['cake_pickup_view_left_mm'] if use_left_view else None)
+                left_view=left_view)
             runtime.bootstrap(deadline)
             self._pickup_prepared = True
         runtime.observe_objects()

@@ -16,7 +16,7 @@ base_alignment_tolerance_m: 0.01 # 软件请求，不代表底盘已经实测达
 manipulation_confirm_frames: 2
 holding_observation_timeout: 2.0
 max_pick_retries: 1
-allow_cake_degradation: true
+allow_cake_degradation: false
 initial_cycle_budget_seconds: 120.0 # 首轮估计；之后用实际完成循环耗时更新
 # 以下开关仅供旧topic后端保留，不作为serial_rgbd的虚假就绪声明。
 hardware_ready: false

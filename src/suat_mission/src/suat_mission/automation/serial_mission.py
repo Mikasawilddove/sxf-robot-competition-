@@ -383,14 +383,13 @@ class SerialMissionRuntime:
 
         approach = float(self.geometry.values.get('approach_offset_mm', 40.))
         lift = float(self.geometry.values.get('lift_offset_mm', 50.))
-        forward = float(self.config.get('stationary_forward_correction_mm', 0.))
-        if self.geometry.values.get('grasp_xy_source') == 'official-planar':
-            forward = 0.
+        source = self.geometry.grasp_source(label)
+        forward = float(self.config.get('stationary_forward_correction_mm', 0.)) if source == 'dlt' else 0.
         if not math.isfinite(approach) or approach <= 0. or not math.isfinite(lift) or lift <= 0.:
             return ActionResult(context, Outcome.UNREACHABLE, 'invalid approach or lift height')
         correction = (0., 0., 0.)
         cup = self.observed_cup(scene)
-        if cup is not None and self.geometry.values.get('grasp_xy_source', 'dlt') == 'dlt':
+        if cup is not None and source == 'dlt':
             reference = (*cup[:2], cup[2]+self.geometry.cup_offset)
             offset = [measured-observed for measured,observed in zip(self.arm_pose,reference)]
             if math.hypot(*offset) <= float(self.geometry.values.get('max_visual_correction_mm', 30.)):
@@ -425,7 +424,7 @@ class SerialMissionRuntime:
         target = self.selected_target = option
         self.grasp_camera_offset = correction
         self.event('first_frame_grasp_plan', object_id=target.object_id, scene_version=scene.version,
-                   source_stamp=scene.source_stamp, selected_source=self.geometry.values.get('grasp_xy_source', 'dlt'),
+                   source_stamp=scene.source_stamp, selected_source=source,
                    grasp_pixel=target.surface.get('grasp_pixel'),
                    top_arm_mm=self.geometry.point(target), support_arm_z_mm=target.surface.get('support_z_mm'),
                    nominal_contact_mm=nominal, reference_offset_mm=correction,

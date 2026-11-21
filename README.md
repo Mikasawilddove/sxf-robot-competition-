@@ -11,30 +11,34 @@
 | 机械臂 | [manipulation/](src/suat_mission/src/suat_mission/manipulation/) | 抓取几何、机械臂控制和抓放反馈 |
 | 自动化 | [automation/](src/suat_mission/src/suat_mission/automation/) | 任务状态机、读板站选择、单 Enter 控制和运行记录 |
 | 运行配置 | [config/](src/suat_mission/config/) · [launch/](src/suat_mission/launch/) | ROS 参数、节点连接、RViz 显示 |
-| 启动入口 | [tools/run_match.sh](tools/run_match.sh) · [tools/run_competition.py](tools/run_competition.py) | 准备并启动完整比赛流程 |
+| 启动入口 | [tools/run_field_match.sh](tools/run_field_match.sh) · [tools/run_match.sh](tools/run_match.sh) | 从当前工作区启动比赛或单蛋糕验收 |
 
 ## 正式启动
 
-在具备 ROS 1 Noetic、Spark-I 驱动、realsense2_camera、RViz 及已构建 catkin 工作区的机器人上，从项目根目录运行：
+本分支以真机 `spark-direct-board-e6e4276.FZEiBY` 的实际源码为基线。仓库收录执行代码，现场资源按原路径配置。使用 Ubuntu 20.04 / ROS 1 Noetic 和现有 Spark-I、SwiftPro、RealSense 驱动。在这份 checkout 内加载 Noetic 与底层驱动环境，再运行 `catkin_make`。部署到现有真机工作区时保留该工作区的现场资源。
 
 ```bash
-bash tools/run_match.sh cake-only --at-start-a --speed fast --planner rollout
+bash tools/run_field_match.sh
 ```
 
-将机器人预先摆在已标定的 A 区起点，朝 D。脚本提示后按一次 Enter。脚本自行启动或复用 ROS、定位、RGB-D 相机和导航，在有桌面显示时打开相机预览和 RViz，定位与任务准备通过后自动开始。蛋糕流程依次执行导航、停车读板、取物、运送和放置，并保留结果。启动准备计入本次时间预算。
+将机器人摆在已标定的 A 区起点，朝 D。等待启动提示后按一次 Enter。正式入口固定选用这个工作区的 `path` 导航、`fast` 档和西侧抓取标定。启动程序会核对 `suat_mission` 解析到当前工作区。脚本启动相机、定位和任务节点，在有桌面时显示相机与 RViz。
 
-正式入口的两种局部规划模式共用 Navfn、代价地图、碰撞范围和速度档。默认使用 Trajectory Rollout，DWA 可用下面的命令启动同一任务。
+正式流程先停车读分类板，将蛋糕送入 A 区并确认落区，再按本局 B/C/D 映射搬运熊、时钟和香蕉。单蛋糕试验仍可使用同一个入口：
 
 ```bash
-bash tools/run_match.sh cake-only --at-start-a --speed fast --planner dwa
+bash tools/run_field_match.sh cake-only
 ```
 
-`--planner dwa` 按控制周期内可达的速度窗口采样。`--planner rollout` 在预测时域内模拟加速。两种模式均以 `fast` 巡航，接近任务站时停车切到 `slow`。Rollout 在靠近目标时缩短预测时域，以保留直行微调候选。速度和精度仍待实机验收。
-
-只查看两种模式的参数时，可用 `python3 tools/start_field_navigation.py --describe --owner mission --speed fast --planner rollout`，将末尾换成 `dwa` 查看另一组。正式日志会记录每段实际生效的采样参数、里程计速度峰值及最后停稳误差。
+蛋糕按实抓配套四系数求 XY，并使用 20 cm 标定面的实测接触 Z。三种普通块按自己的 RGB-D 顶面求抓取点，由控制器验证可达性。携带时使用吸盘附近的 RGB-D 证据，观测断流或确认空手时沿用停车逻辑。到放置站后继续使用原有的落区观测流程。
 
 ## 本地现场资源
 
 部署时保留现场已核验的选图配置、地图、起点和路线、读板与抓取标定，以及视觉所需模板。选图配置位于 `src/suat_mission/config/selected_map.yaml`，现场数据位于 `data/`，模板位于 `src/suat_mission/assets/templates/`。运行记录写入 `reports/`。这些资源和凭据由团队另行管理，公开仓库提供可审查、可回退的代码版本。
 
+正式入口读取本工作区 `data/calibration/cake_west_20cm_e6e4276/` 下配套的 `geometry.yaml`、`profile.yaml` 和 `thefile.txt`。几何配置应为同次部署版本，包含 `rgbd_pickup_labels: [clock, teddybear, banana]`。三个文件需要一起保留。
+
 正式导航使用与选图绑定的 `data/navigation/central_pickup_keepout.json` 定义中央方块区。场地版本和边界须与实物核对。全局与局部规划绕行该区，底盘输出同时按实时位姿与足迹检查。四方位取物候选须分别确认净空后才能切入正式路线。
+
+## 实机验证记录
+
+真机运行 `04d34e3d92a8435c860f88c1a922be17` 完成读板、西侧抓起及持物确认，在前往 Collection_A 时因持物观测超时中止。对应的修复已在真机工作区编译，并用模拟输入验证了运输时的观测分支和普通块接触点计算。修复后的 A 区交付及三类普通块全程仍待真机验收。
